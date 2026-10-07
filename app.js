@@ -43,6 +43,13 @@ export function createHandler(db) {
   // Barcha yozuvlar tranzaksiyada; foydalanuvchi id si change_log trigger'i uchun saqlanadi
   const txu = (user, fn) => db.tx(async (t) => { await t.q("SELECT set_config('app.user_id', ?, true)", [String(user.id)]); return fn(t); });
 
+  const r6 = (n) => Math.round(n * 1e6) / 1e6;
+  // Ombor daftariga yozuv (products.stock'ni baza triggeri yangilaydi; to'g'ridan-to'g'ri o'zgartirish taqiqlangan)
+  const moveStock = (t, { product_id, type, qty, sale_id = null, receipt_id = null, user }) =>
+    t.run('INSERT INTO stock_moves(product_id,type,qty,sale_id,receipt_id,user_id) VALUES(?,?,?,?,?,?)', [product_id, type, r6(qty), sale_id, receipt_id, user.id]);
+  const ledger = (t, { customer_id, kind, amount, sale_id = null, debt_payment_id = null }) =>
+    t.run('INSERT INTO customer_ledger(customer_id,kind,amount,sale_id,debt_payment_id) VALUES(?,?,?,?,?)', [customer_id, kind, amount, sale_id, debt_payment_id]);
+
   // ---------- Auth ----------
   const WINDOW = "interval '15 minutes'";
   route('POST', '/api/login', null, async ({ body, ip, res, secure }) => {
@@ -86,9 +93,10 @@ export function createHandler(db) {
     const stock = num(body.stock ?? 0, 'Qoldiq');
     try {
       return await txu(user, async (t) => {
-        const { id } = await t.one(`INSERT INTO products(sku,name,category,unit,price,cost,stock,min_stock)
-          VALUES(?,?,?,?,?,?,?,?) RETURNING id`, [p.sku, p.name, p.category, p.unit, p.price, p.cost, stock, p.min_stock]);
-        if (stock) await t.run('INSERT INTO stock_moves(product_id,type,qty,user_id) VALUES(?,?,?,?)', [id, 'initial', stock, user.id]);
+        const { id } = await t.one(`INSERT INTO products(sku,name,category,unit,price,cost,min_stock)
+          VALUES(?,?,?,?,?,?,?) RETURNING id`, [p.sku, p.name, p.category, p.unit, p.price, p.cost, p.min_stock]);
+        // Boshlang'ich qoldiq ham hujjat: 'opening' kirimi (hujjatsiz qoldiq bo'lmaydi)
+        if (stock > 0) await receiveStock(t, { items: [{ product_id: id, qty: stock, cost: p.cost }], supplier_id: null, note: 'Boshlang\'ich qoldiq', user, kind: 'opening' });
         return { id };
       });
     } catch (e) { if (isUnique(e)) throw bad('Bu SKU band'); throw e; }
@@ -145,10 +153,12 @@ export function createHandler(db) {
   route('POST', '/api/customers/:id/payments', ['admin', 'seller'], ({ body, params, user }) => {
     const amount = num(body.amount, 'Summa', { int: true, min: 1 });
     return txu(user, async (t) => {
-      const c = await t.one('UPDATE customers SET balance = balance - ? WHERE id=? AND balance >= ? RETURNING balance', [amount, idArg(params.id), amount]);
-      if (!c) throw new HttpError(409, 'Summa mijoz qarzidan oshib ketdi yoki mijoz topilmadi');
-      await t.run('INSERT INTO debt_payments(customer_id,user_id,amount) VALUES(?,?,?)', [params.id, user.id, amount]);
-      return { balance: c.balance };
+      const c = await t.one('SELECT id,balance FROM customers WHERE id=? FOR UPDATE', [idArg(params.id)]);
+      if (!c) throw new HttpError(404, 'Mijoz topilmadi');
+      if (amount > c.balance) throw new HttpError(409, 'Summa mijoz qarzidan oshib ketdi');
+      const { id } = await t.one('INSERT INTO debt_payments(customer_id,user_id,amount) VALUES(?,?,?) RETURNING id', [c.id, user.id, amount]);
+      await ledger(t, { customer_id: c.id, kind: 'payment', amount: -amount, debt_payment_id: id });
+      return { id, balance: c.balance - amount };
     });
   });
 
@@ -173,8 +183,9 @@ export function createHandler(db) {
       const rows = [];
       let subtotal = 0;
       for (const it of items) {
-        const p = await t.one('SELECT id,name,price,cost FROM products WHERE id=? AND active', [it.product_id]);
-        if (!p) throw bad('Mahsulot topilmadi');
+        const p = await t.one('SELECT id,name,price,cost,stock FROM products WHERE id=? AND active FOR UPDATE', [it.product_id]);
+        if (!p) throw bad('Mahsulot topilmadi yoki noaktiv');
+        if (p.stock < it.qty) throw new HttpError(409, `"${p.name}" omborda yetarli emas (qoldiq: ${p.stock})`);
         const gross = Math.round(p.price * it.qty);
         subtotal += gross;
         rows.push({ p, qty: it.qty, gross });
@@ -199,12 +210,10 @@ export function createHandler(db) {
         // chegirma qatorlarga proporsional taqsimlanadi, qoldiq oxirgi qatorga
         const line = i === rows.length - 1 ? left : (subtotal ? Math.round(r.gross * total / subtotal) : 0);
         left -= line;
-        const upd = await t.one('UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ? RETURNING stock', [r.qty, r.p.id, r.qty]);
-        if (!upd) throw new HttpError(409, `"${r.p.name}" omborda yetarli emas`);
         await t.run('INSERT INTO sale_items(sale_id,product_id,qty,price,line_total,cost) VALUES(?,?,?,?,?,?)', [sid, r.p.id, r.qty, r.p.price, line, r.p.cost]);
-        await t.run('INSERT INTO stock_moves(product_id,type,qty,ref_id,user_id) VALUES(?,?,?,?,?)', [r.p.id, 'sale', -r.qty, sid, user.id]);
+        await moveStock(t, { product_id: r.p.id, type: 'sale', qty: -r.qty, sale_id: sid, user });
       }
-      if (paid < total) await t.run('UPDATE customers SET balance = balance + ? WHERE id=?', [total - paid, customer_id]);
+      if (paid < total) await ledger(t, { customer_id, kind: 'sale_debt', amount: total - paid, sale_id: sid });
       return { id: sid, subtotal, discount, total, paid, debt: total - paid };
     });
   });
@@ -258,29 +267,30 @@ export function createHandler(db) {
       for (const r of picked) {
         await t.run('INSERT INTO sale_items(sale_id,product_id,orig_item_id,qty,price,line_total,cost) VALUES(?,?,?,?,?,?,?)',
           [id, r.it.product_id, r.it.id, -r.qty, r.it.price, -r.amount, r.it.cost]);
-        await t.run('UPDATE products SET stock = stock + ? WHERE id=?', [r.qty, r.it.product_id]);
-        await t.run('INSERT INTO stock_moves(product_id,type,qty,ref_id,user_id) VALUES(?,?,?,?,?)', [r.it.product_id, 'return', r.qty, id, user.id]);
+        await moveStock(t, { product_id: r.it.product_id, type: 'return', qty: r.qty, sale_id: id, user });
       }
       let toDebtAmt = 0;
       if (toDebt) { // qaytarilgan summa avval mijoz qarzini kamaytiradi, ortig'i naqd qaytariladi
         const c = await t.one('SELECT balance FROM customers WHERE id=? FOR UPDATE', [sale.customer_id]);
         toDebtAmt = Math.min(total, c.balance);
-        if (toDebtAmt) await t.run('UPDATE customers SET balance = balance - ? WHERE id=?', [toDebtAmt, sale.customer_id]);
+        if (toDebtAmt) await ledger(t, { customer_id: sale.customer_id, kind: 'return_credit', amount: -toDebtAmt, sale_id: id });
       }
       return { id, total, to_debt: toDebtAmt, cash_refund: total - toDebtAmt };
     });
   });
 
   // ---------- Kirim ----------
-  const receiveStock = async (t, { items, supplier_id, note, user, source }) => {
-    const total = items.reduce((a, it) => a + Math.round(it.cost * it.qty), 0); // hujjat o'zgarmas: jami oldindan
-    const { id: rid } = await t.one('INSERT INTO receipts(user_id,supplier_id,note,total) VALUES(?,?,?,?) RETURNING id', [user.id, supplier_id ?? null, note, total]);
-    for (const it of items) {
-      const p = await t.one('SELECT id FROM products WHERE id=? AND active', [it.product_id]);
+  // Kirim hujjati: qatorlar + ombor daftari. kind: receipt | opening; po_id — buyurtma bo'yicha bo'lsa
+  const receiveStock = async (t, { items, supplier_id, note, user, source = 'receipt', kind = 'receipt', po_id = null }) => {
+    const lines = items.map((it) => ({ ...it, line_total: Math.round(it.cost * it.qty) }));
+    const total = lines.reduce((a, l) => a + l.line_total, 0); // hujjat o'zgarmas: jami oldindan
+    const { id: rid } = await t.one('INSERT INTO receipts(user_id,kind,supplier_id,po_id,note,total) VALUES(?,?,?,?,?,?) RETURNING id', [user.id, kind, supplier_id ?? null, po_id, note, total]);
+    for (const it of lines) {
+      const p = await t.one('SELECT id FROM products WHERE id=? AND active FOR UPDATE', [it.product_id]);
       if (!p) throw bad('Mahsulot topilmadi yoki noaktiv');
-      await t.run('INSERT INTO receipt_items(receipt_id,product_id,qty,cost) VALUES(?,?,?,?)', [rid, it.product_id, it.qty, it.cost]);
-      await t.run('UPDATE products SET stock=stock+?, cost=? WHERE id=?', [it.qty, it.cost, it.product_id]);
-      await t.run('INSERT INTO stock_moves(product_id,type,qty,ref_id,user_id) VALUES(?,?,?,?,?)', [it.product_id, source, it.qty, rid, user.id]);
+      await t.run('INSERT INTO receipt_items(receipt_id,product_id,qty,cost,line_total) VALUES(?,?,?,?,?)', [rid, it.product_id, it.qty, it.cost, it.line_total]);
+      await moveStock(t, { product_id: it.product_id, type: kind === 'opening' ? 'opening' : source, qty: it.qty, receipt_id: rid, user });
+      await t.run('UPDATE products SET cost=? WHERE id=?', [it.cost, it.product_id]);
     }
     return { id: rid, total };
   };
@@ -304,17 +314,91 @@ export function createHandler(db) {
     const r = await t.one("SELECT * FROM receipts WHERE id=? AND kind='receipt' FOR UPDATE", [idArg(params.id)]);
     if (!r) throw new HttpError(404, 'Kirim topilmadi');
     if (await t.one('SELECT 1 x FROM receipts WHERE ref_receipt_id=?', [r.id])) throw new HttpError(409, 'Bu kirim allaqachon storno qilingan');
-    const items = await t.q('SELECT i.product_id,i.qty,i.cost,p.name FROM receipt_items i JOIN products p ON p.id=i.product_id WHERE i.receipt_id=? ORDER BY i.product_id', [r.id]);
+    const items = await t.q('SELECT i.product_id,i.qty,i.cost,i.line_total,p.name FROM receipt_items i JOIN products p ON p.id=i.product_id WHERE i.receipt_id=? ORDER BY i.product_id', [r.id]);
     const { id } = await t.one("INSERT INTO receipts(user_id,supplier_id,kind,ref_receipt_id,note,total) VALUES(?,?,'reversal',?,?,?) RETURNING id",
       [user.id, r.supplier_id, r.id, `Storno: kirim #${r.id}`, -r.total]);
     for (const it of items) {
-      const u = await t.one('UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ? RETURNING stock', [it.qty, it.product_id, it.qty]);
-      if (!u) throw new HttpError(409, `"${it.name}" omborda yetarli emas — storno mumkin emas (tovar allaqachon sotilgan)`);
-      await t.run('INSERT INTO receipt_items(receipt_id,product_id,qty,cost) VALUES(?,?,?,?)', [id, it.product_id, -it.qty, it.cost]);
-      await t.run('INSERT INTO stock_moves(product_id,type,qty,ref_id,user_id) VALUES(?,?,?,?,?)', [it.product_id, 'receipt_reversal', -it.qty, id, user.id]);
+      const cur = await t.one('SELECT stock FROM products WHERE id=? FOR UPDATE', [it.product_id]);
+      if (cur.stock < it.qty) throw new HttpError(409, `"${it.name}" omborda yetarli emas — storno mumkin emas (tovar allaqachon sotilgan)`);
+      await t.run('INSERT INTO receipt_items(receipt_id,product_id,qty,cost,line_total) VALUES(?,?,?,?,?)', [id, it.product_id, -it.qty, it.cost, -it.line_total]);
+      await moveStock(t, { product_id: it.product_id, type: 'receipt_reversal', qty: -it.qty, receipt_id: id, user });
     }
     return { id, total: -r.total };
   }));
+
+  // ---------- Hujjatlar zanjiri (SAP: document flow) ----------
+  route('GET', '/api/admin/document-flow', ['admin'], async ({ query }) => {
+    const id = idArg(query.id); const type = query.type;
+    const NF = new HttpError(404, 'Hujjat topilmadi');
+    if (type === 'sale') {
+      const doc = await db.one(`SELECT s.*,u.name "user",c.name customer FROM sales s JOIN users u ON u.id=s.user_id LEFT JOIN customers c ON c.id=s.customer_id WHERE s.id=?`, [id]);
+      if (!doc) throw NF;
+      const lines = await db.q('SELECT i.id,i.orig_item_id,p.name,p.unit,i.qty,i.price,i.line_total FROM sale_items i JOIN products p ON p.id=i.product_id WHERE i.sale_id=? ORDER BY i.id', [id]);
+      const moves = await db.q('SELECT m.id,m.type,m.qty,m.created_at,p.name product FROM stock_moves m JOIN products p ON p.id=m.product_id WHERE m.sale_id=? ORDER BY m.id', [id]);
+      const led = await db.q('SELECT id,kind,amount,created_at FROM customer_ledger WHERE sale_id=? ORDER BY id', [id]);
+      const related = [];
+      if (doc.ref_sale_id) related.push({ type: 'sale', id: doc.ref_sale_id, relation: 'Asl sotuv' });
+      for (const r of await db.q('SELECT id,total FROM sales WHERE ref_sale_id=? ORDER BY id', [id])) related.push({ type: 'sale', id: r.id, relation: 'Qaytarish', total: r.total });
+      return { type, doc, lines, moves, ledger: led, related };
+    }
+    if (type === 'receipt') {
+      const doc = await db.one(`SELECT r.*,u.name "user",sp.name supplier FROM receipts r JOIN users u ON u.id=r.user_id LEFT JOIN suppliers sp ON sp.id=r.supplier_id WHERE r.id=?`, [id]);
+      if (!doc) throw NF;
+      const lines = await db.q('SELECT i.id,p.name,p.unit,i.qty,i.cost,i.line_total FROM receipt_items i JOIN products p ON p.id=i.product_id WHERE i.receipt_id=? ORDER BY i.id', [id]);
+      const moves = await db.q('SELECT m.id,m.type,m.qty,m.created_at,p.name product FROM stock_moves m JOIN products p ON p.id=m.product_id WHERE m.receipt_id=? ORDER BY m.id', [id]);
+      const related = [];
+      if (doc.po_id) related.push({ type: 'po', id: doc.po_id, relation: 'Buyurtma' });
+      if (doc.ref_receipt_id) related.push({ type: 'receipt', id: doc.ref_receipt_id, relation: 'Asl kirim' });
+      for (const r of await db.q('SELECT id,total FROM receipts WHERE ref_receipt_id=?', [id])) related.push({ type: 'receipt', id: r.id, relation: 'Storno hujjati', total: r.total });
+      return { type, doc, lines, moves, ledger: [], related };
+    }
+    if (type === 'po') {
+      const doc = await db.one(`SELECT o.*,u.name "user",sp.name supplier FROM purchase_orders o JOIN users u ON u.id=o.created_by LEFT JOIN suppliers sp ON sp.id=o.supplier_id WHERE o.id=?`, [id]);
+      if (!doc) throw NF;
+      const lines = await db.q('SELECT i.id,p.name,p.unit,i.qty,i.cost,i.line_total FROM po_items i JOIN products p ON p.id=i.product_id WHERE i.po_id=? ORDER BY i.id', [id]);
+      const related = (await db.q('SELECT id,total FROM receipts WHERE po_id=?', [id])).map((r) => ({ type: 'receipt', id: r.id, relation: 'Qabul qilingan kirim', total: r.total }));
+      return { type, doc, lines, moves: [], ledger: [], related };
+    }
+    if (type === 'payment') {
+      const doc = await db.one(`SELECT d.*,u.name "user",c.name customer FROM debt_payments d JOIN users u ON u.id=d.user_id JOIN customers c ON c.id=d.customer_id WHERE d.id=?`, [id]);
+      if (!doc) throw NF;
+      const led = await db.q('SELECT id,kind,amount,created_at FROM customer_ledger WHERE debt_payment_id=?', [id]);
+      return { type, doc, lines: [], moves: [], ledger: led, related: [] };
+    }
+    throw bad('type: sale | receipt | po | payment');
+  });
+
+  // Yaxlitlik nazorati: qoldiq/qarz daftarga, hujjat jami qatorlarga, qatorlar ombor harakatlariga teng bo'lishi shart
+  const CHECKS = [
+    ['stock', 'Mahsulot qoldig\'i = ombor daftari yig\'indisi', `SELECT p.id, p.name, p.stock, COALESCE(SUM(m.qty),0) AS ledger FROM products p LEFT JOIN stock_moves m ON m.product_id=p.id
+      GROUP BY p.id HAVING abs(p.stock - COALESCE(SUM(m.qty),0)) > 0.000001`],
+    ['balance', 'Mijoz qarzi = mijoz daftari yig\'indisi', `SELECT c.id, c.name, c.balance, COALESCE(SUM(l.amount),0) AS ledger FROM customers c LEFT JOIN customer_ledger l ON l.customer_id=c.id
+      GROUP BY c.id HAVING c.balance <> COALESCE(SUM(l.amount),0)`],
+    ['sale_total', 'Sotuv jami = qatorlar yig\'indisi (qatorsiz sotuv yo\'q)', `SELECT s.id, s.total, COALESCE(SUM(i.line_total),0) AS lines FROM sales s LEFT JOIN sale_items i ON i.sale_id=s.id
+      GROUP BY s.id HAVING s.total <> COALESCE(SUM(i.line_total),0) OR COUNT(i.id)=0`],
+    ['sale_moves', 'Sotuv qatorlari = ombor harakatlari', `SELECT COALESCE(i.sale_id,m.sale_id) AS id, COALESCE(i.product_id,m.product_id) AS product_id FROM
+      (SELECT sale_id, product_id, SUM(qty) q FROM sale_items GROUP BY 1,2) i FULL JOIN (SELECT sale_id, product_id, SUM(-qty) q FROM stock_moves WHERE sale_id IS NOT NULL GROUP BY 1,2) m
+      ON i.sale_id=m.sale_id AND i.product_id=m.product_id WHERE abs(COALESCE(i.q,0)-COALESCE(m.q,0)) > 0.000001`],
+    ['receipt_total', 'Kirim jami = qatorlar yig\'indisi (qatorsiz kirim yo\'q)', `SELECT r.id, r.total, COALESCE(SUM(i.line_total),0) AS lines FROM receipts r LEFT JOIN receipt_items i ON i.receipt_id=r.id
+      GROUP BY r.id HAVING r.total <> COALESCE(SUM(i.line_total),0) OR COUNT(i.id)=0`],
+    ['receipt_moves', 'Kirim qatorlari = ombor harakatlari', `SELECT COALESCE(i.receipt_id,m.receipt_id) AS id, COALESCE(i.product_id,m.product_id) AS product_id FROM
+      (SELECT receipt_id, product_id, SUM(qty) q FROM receipt_items GROUP BY 1,2) i FULL JOIN (SELECT receipt_id, product_id, SUM(qty) q FROM stock_moves WHERE receipt_id IS NOT NULL GROUP BY 1,2) m
+      ON i.receipt_id=m.receipt_id AND i.product_id=m.product_id WHERE abs(COALESCE(i.q,0)-COALESCE(m.q,0)) > 0.000001`],
+    ['po_total', 'Buyurtma jami = qatorlar yig\'indisi', `SELECT o.id, o.total FROM purchase_orders o LEFT JOIN po_items i ON i.po_id=o.id GROUP BY o.id HAVING o.total <> COALESCE(SUM(i.line_total),0) OR COUNT(i.id)=0`],
+    ['po_receipt', 'Qabul qilingan buyurtma <-> kirim hujjati', `SELECT o.id FROM purchase_orders o WHERE (o.status='received') <> EXISTS (SELECT 1 FROM receipts r WHERE r.po_id=o.id AND r.kind='receipt')`],
+    ['debt_sale', 'Nasiya sotuvlari = mijoz daftari', `SELECT s.id, s.total - s.paid AS debt, COALESCE(SUM(l.amount),0) AS ledger FROM sales s LEFT JOIN customer_ledger l ON l.sale_id=s.id AND l.kind='sale_debt'
+      WHERE s.kind='sale' GROUP BY s.id HAVING s.total - s.paid <> COALESCE(SUM(l.amount),0)`],
+    ['debt_payment', 'Qarz to\'lovlari = mijoz daftari', `SELECT d.id FROM debt_payments d WHERE NOT EXISTS (SELECT 1 FROM customer_ledger l WHERE l.debt_payment_id=d.id AND l.amount=-d.amount)`],
+    ['returns', 'Qaytarishlar sotilgan miqdordan oshmaydi', `SELECT o.id, o.qty, -SUM(r.qty) AS returned FROM sale_items o JOIN sale_items r ON r.orig_item_id=o.id GROUP BY o.id, o.qty HAVING -SUM(r.qty) > o.qty + 0.000001`],
+  ];
+  route('GET', '/api/admin/integrity', ['admin'], async () => {
+    const checks = [];
+    for (const [key, title, sql] of CHECKS) {
+      const rows = await db.q(`SELECT * FROM (${sql}) x LIMIT 20`);
+      checks.push({ key, title, violations: rows.length, samples: rows.slice(0, 5) });
+    }
+    return { ok: checks.every((c) => !c.violations), checked_at: new Date().toISOString(), checks };
+  });
 
   // O'zgarishlar tarixi (audit)
   route('GET', '/api/admin/change-log', ['admin'], ({ query }) => {
@@ -438,7 +522,7 @@ export function createHandler(db) {
         total += Math.round(it.qty * it.cost);
       }
       const { id } = await t.one('INSERT INTO purchase_orders(supplier_id,created_by,total) VALUES(?,?,?) RETURNING id', [supplier_id, user.id, total]);
-      for (const it of items) await t.run('INSERT INTO po_items(po_id,product_id,qty,cost) VALUES(?,?,?,?)', [id, it.product_id, it.qty, it.cost]);
+      for (const it of items) await t.run('INSERT INTO po_items(po_id,product_id,qty,cost,line_total) VALUES(?,?,?,?,?)', [id, it.product_id, it.qty, it.cost, Math.round(it.qty * it.cost)]);
       return { id, total };
     });
   });
@@ -454,7 +538,7 @@ export function createHandler(db) {
     if (!o) throw new HttpError(404, 'Buyurtma topilmadi');
     if (o.status !== 'ordered') throw new HttpError(409, 'Buyurtma allaqachon yopilgan');
     const items = await t.q('SELECT product_id,qty,cost FROM po_items WHERE po_id=? ORDER BY product_id', [o.id]);
-    const r = await receiveStock(t, { items, supplier_id: o.supplier_id, note: `Buyurtma #${o.id}`, user, source: 'purchase' });
+    const r = await receiveStock(t, { items, supplier_id: o.supplier_id, note: `Buyurtma #${o.id}`, user, source: 'purchase', po_id: o.id });
     await t.run("UPDATE purchase_orders SET status='received', closed_at=now() WHERE id=?", [o.id]);
     return r;
   }));
@@ -545,8 +629,16 @@ export function createHandler(db) {
       res.writeHead(200, { 'Content-Type': MIME[extname(rel)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': CSP, 'Permissions-Policy': 'camera=(self)' });
       res.end(data);
     } catch (e) {
-      if (!(e instanceof HttpError)) console.error(e);
-      send(res, e.status || 500, { error: e instanceof HttpError ? e.message : 'Server xatosi' });
+      let status = e.status || 500, msg = e instanceof HttpError ? e.message : 'Server xatosi';
+      if (!(e instanceof HttpError)) {
+        if (typeof e?.code === 'string' && e.code.startsWith('23')) { // baza yaxlitlik qoidasi buzildi
+          status = 409;
+          msg = e.code === '23000' ? e.message : /chk_stock_nonneg/.test(e.constraint || e.message) ? 'Omborda yetarli emas'
+            : /chk_balance_nonneg/.test(e.constraint || e.message) ? 'Qarz summasi noto\'g\'ri' : e.code === '23505' ? 'Takroriy yozuv'
+            : e.code === '23503' ? 'Bog\'liq hujjat/ma\'lumot topilmadi' : 'Ma\'lumot yaxlitligi qoidasi buzildi';
+        } else console.error(e);
+      }
+      send(res, status, { error: msg });
     }
   };
 }

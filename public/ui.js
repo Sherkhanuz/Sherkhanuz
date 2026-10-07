@@ -31,7 +31,10 @@ async function api(method, path, body) {
 const get = (p) => api('GET', p);
 const post = (p, b) => api('POST', p, b || {});
 
-const state = { user: null, tab: null, scanner: null };
+const state = { user: null, tab: null, scanner: null, flow: null };
+// Hujjatlar zanjirini ochish (boshqa ekrandan): state.flow ni qo'yib, 'flow' bo'limiga o'tadi
+const openFlow = (type, id) => { state.flow = { type, id }; state.tab = 'flow'; render(); };
+const flowBtn = (type, id) => h('button', { class: 'btn sec', onclick: () => openFlow(type, id) }, 'Zanjir');
 const root = $('#root');
 
 // ---------- diagramma (inline SVG) ----------
@@ -232,10 +235,10 @@ async function receiptView() {
     const rows = await get('/api/receipts?date=' + today());
     const reversed = new Set(rows.filter((r) => r.kind === 'reversal').map((r) => r.ref_receipt_id));
     hist.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Yetkazuvchi', 'Mahsulotlar', 'Summa'].concat(isAdmin ? [''] : []), rows.map((r) => [r.id, hhmm(r.created_at), r.supplier || '—',
-      r.kind === 'reversal' ? h('span', { class: 'tag low' }, 'Storno: ' + r.items) : r.items, money(r.total)].concat(isAdmin ? [r.kind === 'receipt' && !reversed.has(r.id) ? h('button', { class: 'btn sec', onclick: async () => {
+      r.kind === 'reversal' ? h('span', { class: 'tag low' }, 'Storno: ' + r.items) : r.kind === 'opening' ? h('span', { class: 'tag ok' }, "Boshlang'ich: " + r.items) : r.items, money(r.total)].concat(isAdmin ? [h('span', { class: 'row', style: 'margin:0' }, flowBtn('receipt', r.id), r.kind === 'receipt' && !reversed.has(r.id) ? h('button', { class: 'btn sec', onclick: async () => {
         if (!confirm(`Kirim #${r.id} storno qilinsinmi? Tovar ombordan ayriladi, asl hujjat saqlanadi.`)) return;
         try { await post(`/api/admin/receipts/${r.id}/reverse`); flash(box, 'Storno hujjati yaratildi', 'ok'); loadHist(); } catch (e) { flash(box, e.message); }
-      } }, 'Storno') : (r.kind === 'receipt' ? h('span', { class: 'mute' }, 'storno qilingan') : '')] : [])), [4]) : h('p', { class: 'mute' }, 'Bugun kirim yo\'q'));
+      } }, 'Storno') : (r.kind === 'receipt' ? h('span', { class: 'mute' }, 'storno qilingan') : null))] : [])), [4]) : h('p', { class: 'mute' }, 'Bugun kirim yo\'q'));
   };
   const addSup = async () => {
     if (!newSup.value.trim()) return;
@@ -374,14 +377,14 @@ async function ordersView() {
   const S = { ordered: 'Yo\'lda', received: 'Qabul qilingan', cancelled: 'Bekor' };
   const load = async () => {
     const os = await get('/api/admin/purchase-orders');
-    out.replaceChildren(os.length ? os.map((o) => h('div', { class: 'card' },
-      h('div', { class: 'row', style: 'justify-content:space-between' }, h('b', {}, `Buyurtma #${o.id} · ${o.supplier || 'yetkazib beruvchisiz'}`), h('span', { class: 'tag ' + o.status }, S[o.status])),
+    out.replaceChildren(...(os.length ? os.map((o) => h('div', { class: 'card' },
+      h('div', { class: 'row', style: 'justify-content:space-between' }, h('b', {}, `Buyurtma #${o.id} · ${o.supplier || 'yetkazib beruvchisiz'}`), h('span', { class: 'row', style: 'margin:0' }, flowBtn('po', o.id), h('span', { class: 'tag ' + o.status }, S[o.status]))),
       h('div', { class: 'mute' }, hhmm(o.created_at) + (o.supplier_phone ? ' · ' + o.supplier_phone : '')),
       table(['Mahsulot', 'Miqdor', 'Narx'], o.items.map((i) => [i.name, `${qf(i.qty)} ${i.unit}`, fmt(i.cost)]), [1, 2]),
       h('div', { class: 'row', style: 'justify-content:space-between;margin-top:8px' }, h('span', { class: 'total' }, money(o.total)),
         o.status === 'ordered' ? h('span', { class: 'row' },
           h('button', { class: 'btn', onclick: async () => { try { await post(`/api/admin/purchase-orders/${o.id}/receive`); load(); } catch (e) { flash(box, e.message); } } }, 'Qabul qilindi → omborga kirim'),
-          h('button', { class: 'btn sec', onclick: async () => { try { await post(`/api/admin/purchase-orders/${o.id}/cancel`); load(); } catch (e) { flash(box, e.message); } } }, 'Bekor')) : null))) : h('p', { class: 'mute' }, 'Buyurtmalar yo\'q'));
+          h('button', { class: 'btn sec', onclick: async () => { try { await post(`/api/admin/purchase-orders/${o.id}/cancel`); load(); } catch (e) { flash(box, e.message); } } }, 'Bekor')) : null))) : [h('p', { class: 'mute' }, 'Buyurtmalar yo\'q')]));
   };
   await load(); return h('div', {}, box, out);
 }
@@ -390,7 +393,7 @@ async function salesHistoryView() {
   let date = today(); const out = h('div');
   const load = async () => {
     const rows = await get('/api/sales?date=' + date);
-    out.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Sotuvchi', 'Mahsulotlar', 'Summa'], rows.map((r) => [r.id, hhmm(r.created_at), r.seller, r.kind === 'return' ? h('span', { class: 'tag low' }, 'Qaytarish: ' + r.items) : [r.items, r.customer ? ' · ' + r.customer : '', r.discount ? ` · chegirma ${fmt(r.discount)}` : ''].join(''), money(r.total)]), [4]) : h('p', { class: 'mute' }, 'Sotuv yo\'q'));
+    out.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Sotuvchi', 'Mahsulotlar', 'Summa', ''], rows.map((r) => [r.id, hhmm(r.created_at), r.seller, r.kind === 'return' ? h('span', { class: 'tag low' }, 'Qaytarish: ' + r.items) : [r.items, r.customer ? ' · ' + r.customer : '', r.discount ? ` · chegirma ${fmt(r.discount)}` : ''].join(''), money(r.total), flowBtn('sale', r.id)]), [4]) : h('p', { class: 'mute' }, 'Sotuv yo\'q'));
   };
   await load();
   return h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Sotuvlar tarixi'), h('input', { type: 'date', value: date, onchange: (e) => { date = e.target.value; load(); } })), out);
@@ -498,10 +501,62 @@ async function auditView() {
     h('p', { class: 'mute' }, "Ma'lumotlar hech qachon o'chirilmaydi: faqat noaktiv qilinadi. Hujjatlar (sotuv, kirim) o'zgarmaydi — qaytarish/storno bilan tuzatiladi."), out);
 }
 
+// ---------- Admin: hujjatlar zanjiri (SAP: document flow) va yaxlitlik nazorati ----------
+async function flowView() {
+  const out = h('div'), integ = h('div'), box = msgBox();
+  const TYPES = { sale: 'Sotuv / qaytarish', receipt: 'Kirim / storno', po: 'Buyurtma', payment: "Qarz to'lovi" };
+  const MOVE = { sale: 'Sotuv', return: 'Qaytarish', receipt: 'Kirim', purchase: 'Buyurtma kirimi', opening: "Boshlang'ich qoldiq", receipt_reversal: 'Kirim storno' };
+  const LEDGER = { sale_debt: 'Nasiya (sotuvdan)', payment: "To'lov", return_credit: 'Qaytarishdan qarz kamayishi' };
+  const title = (f) => {
+    const d = f.doc;
+    if (f.type === 'sale') return `${d.kind === 'return' ? 'Qaytarish' : 'Sotuv'} #${d.id}`;
+    if (f.type === 'receipt') return `${{ receipt: 'Kirim', opening: "Boshlang'ich qoldiq", reversal: 'Kirim storno' }[d.kind]} #${d.id}`;
+    if (f.type === 'po') return `Buyurtma #${d.id}`;
+    return `Qarz to'lovi #${d.id}`;
+  };
+  const sect = (name, node) => h('div', { class: 'card' }, h('h3', {}, name), node);
+  const show = async (type, id) => {
+    try {
+      const f = await get(`/api/admin/document-flow?type=${type}&id=${id}`);
+      const d = f.doc;
+      const meta = [d.created_at ? hhmm(d.created_at) : null, d.user, d.customer && 'Mijoz: ' + d.customer, d.supplier && 'Yetkazuvchi: ' + d.supplier,
+        d.status && { ordered: "Yo'lda", received: 'Qabul qilingan', cancelled: 'Bekor' }[d.status], d.discount ? 'Chegirma: ' + fmt(d.discount) : null].filter(Boolean).join(' · ');
+      out.replaceChildren(...[
+        h('div', { class: 'card' }, h('div', { class: 'row', style: 'justify-content:space-between' }, h('h3', { style: 'margin:0' }, title(f)),
+          h('span', { class: 'total' }, money(d.total ?? d.amount))), h('div', { class: 'mute' }, meta)),
+        f.related.length ? sect("Bog'liq hujjatlar", h('div', { class: 'row' }, f.related.map((r) => h('button', { class: 'btn sec', onclick: () => show(r.type, r.id) },
+          `${r.relation} #${r.id}${r.total != null ? ' · ' + money(r.total) : ''}`)))) : null,
+        f.lines.length ? sect('Hujjat qatorlari', table(['Mahsulot', 'Miqdor', f.type === 'sale' ? 'Narx' : 'Tannarx', 'Summa'],
+          f.lines.map((l) => [l.name, `${qf(l.qty)} ${l.unit}`, fmt(l.price ?? l.cost), fmt(l.line_total)]), [1, 2, 3])) : null,
+        f.moves.length ? sect('Ombor harakatlari (ombor daftari)', table(['№', 'Mahsulot', 'Turi', 'Miqdor'], f.moves.map((m) => [m.id, m.product, MOVE[m.type] || m.type, (m.qty > 0 ? '+' : '') + qf(m.qty)]), [3])) : null,
+        f.ledger.length ? sect('Mijoz daftari (nasiya)', table(['№', 'Turi', 'Summa'], f.ledger.map((l) => [l.id, LEDGER[l.kind] || l.kind, (l.amount > 0 ? '+' : '') + fmt(l.amount)]), [2])) : null,
+      ].filter(Boolean));
+      flash(box, '');
+    } catch (e) { out.replaceChildren(); flash(box, e.message); }
+  };
+  const typeSel = h('select', {}, Object.entries(TYPES).map(([k, v]) => h('option', { value: k }, v)));
+  const idInp = h('input', { type: 'number', min: 1, placeholder: 'Hujjat raqami', style: 'width:150px' });
+  const check = async () => {
+    integ.replaceChildren(h('p', { class: 'mute' }, 'Tekshirilmoqda...'));
+    try {
+      const r = await get('/api/admin/integrity');
+      integ.replaceChildren(h('div', { class: 'msg ' + (r.ok ? 'ok' : 'err') }, r.ok ? '✅ Zanjir to\'liq: qoldiq, qarz, hujjat jami va ombor harakatlari o\'zaro mos' : '⚠️ Mos kelmaydigan yozuvlar topildi'),
+        table(['Tekshiruv', 'Natija'], r.checks.map((c) => [c.title, c.violations ? h('span', { class: 'tag out' }, `${c.violations} ta xato: ${c.samples.map((x) => '#' + (x.id ?? '?')).join(', ')}`) : h('span', { class: 'tag ok' }, 'OK')])));
+    } catch (e) { integ.replaceChildren(h('div', { class: 'msg err' }, e.message)); }
+  };
+  if (state.flow) { const { type, id } = state.flow; state.flow = null; typeSel.value = type; idInp.value = id; await show(type, id); }
+  return h('div', {}, box,
+    h('div', { class: 'card' }, h('h3', {}, 'Hujjatlar zanjiri'),
+      h('p', { class: 'mute' }, "Har bir hujjat o'zi bog'langan hujjatlar, ombor harakatlari va mijoz daftari bilan ko'rsatiladi: buyurtma → kirim → storno; sotuv → qaytarish; to'lov."),
+      h('div', { class: 'row' }, typeSel, idInp, h('button', { class: 'btn', onclick: () => idInp.value && show(typeSel.value, Number(idInp.value)) }, 'Ochish'))),
+    out,
+    h('div', { class: 'card' }, h('div', { class: 'row', style: 'justify-content:space-between' }, h('h3', { style: 'margin:0' }, 'Yaxlitlik nazorati'), h('button', { class: 'btn sec', onclick: check }, 'Tekshirish')), integ));
+}
+
 const TABS = {
   seller: [['sell', 'Sotuv', sellView], ['receipt', 'Kirim', receiptView], ['stock', 'Ombor', stockView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['mine', 'Sotuvlarim', mySalesView]],
   admin: [['dash', 'Tahlil', dashboardView], ['stock', 'Ombor', stockView], ['offers', 'Xarid takliflari', offersView], ['orders', 'Buyurtmalar', ordersView],
-    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['sup', 'Yetkazuvchilar', suppliersView], ['audit', 'Tarix', auditView], ['users', 'Foydalanuvchilar', usersView]],
+    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['sup', 'Yetkazuvchilar', suppliersView], ['flow', 'Hujjatlar', flowView], ['audit', 'Tarix', auditView], ['users', 'Foydalanuvchilar', usersView]],
 };
 
 async function render() {

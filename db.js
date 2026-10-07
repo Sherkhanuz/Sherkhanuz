@@ -55,112 +55,288 @@ export async function openDb({ url = process.env.DATABASE_URL, dir = process.env
   return db;
 }
 
+// ============================================================================
+// SXEMA (v3) — hujjatlar zanjiri
+//
+//   Buyurtma (purchase_orders) ──► Kirim (receipts: receipt|opening) ──► Storno (receipts: reversal)
+//                                         │ receipt_items                    
+//   Sotuv (sales: sale) ──► Qaytarish (sales: return, ref_sale_id)          
+//         │ sale_items (return qatori -> orig_item_id)                      
+//         ▼                                                                  
+//   Ombor daftari (stock_moves: har biri aynan bitta hujjatga FK) ──► products.stock (faqat daftar orqali)
+//   Mijoz daftari (customer_ledger: sotuv/to'lov/qaytarish) ──► customers.balance (faqat daftar orqali)
+// ============================================================================
 export const SCHEMA = `
-CREATE TABLE IF NOT EXISTS users(
+CREATE TABLE users(
   id BIGSERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('admin','seller')), password_hash TEXT NOT NULL,
   active BOOLEAN NOT NULL DEFAULT TRUE);
-CREATE TABLE IF NOT EXISTS sessions(
+CREATE TABLE sessions(
   token TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS login_attempts(
+  revoked BOOLEAN NOT NULL DEFAULT FALSE, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE login_attempts(
   ip TEXT PRIMARY KEY, n INT NOT NULL, t TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS products(
+
+-- Asosiy ma'lumotlar (aktiv/noaktiv)
+CREATE TABLE products(
   id BIGSERIAL PRIMARY KEY, sku TEXT UNIQUE, name TEXT NOT NULL, category TEXT DEFAULT '',
-  unit TEXT NOT NULL DEFAULT 'dona', price BIGINT NOT NULL DEFAULT 0, cost BIGINT NOT NULL DEFAULT 0,
-  stock DOUBLE PRECISION NOT NULL DEFAULT 0, min_stock DOUBLE PRECISION NOT NULL DEFAULT 0,
-  active BOOLEAN NOT NULL DEFAULT TRUE);
-CREATE TABLE IF NOT EXISTS suppliers(
-  id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, phone TEXT DEFAULT '');
-CREATE TABLE IF NOT EXISTS customers(
+  unit TEXT NOT NULL DEFAULT 'dona', price BIGINT NOT NULL DEFAULT 0 CHECK(price >= 0), cost BIGINT NOT NULL DEFAULT 0 CHECK(cost >= 0),
+  stock DOUBLE PRECISION NOT NULL DEFAULT 0, min_stock DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK(min_stock >= 0),
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  CONSTRAINT chk_stock_nonneg CHECK(stock >= 0));          -- qoldiq manfiy bo'lmaydi
+CREATE TABLE suppliers(
+  id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, phone TEXT DEFAULT '', active BOOLEAN NOT NULL DEFAULT TRUE);
+CREATE TABLE customers(
   id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, phone TEXT DEFAULT '',
-  balance BIGINT NOT NULL DEFAULT 0 CHECK(balance >= 0)); -- balance = nasiya (qarz)
-CREATE TABLE IF NOT EXISTS debt_payments(
-  id BIGSERIAL PRIMARY KEY, customer_id BIGINT NOT NULL REFERENCES customers(id),
-  user_id BIGINT NOT NULL REFERENCES users(id), amount BIGINT NOT NULL CHECK(amount > 0),
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now());
--- kind='return' — qaytarish: manfiy miqdor/summali qatorlar, shuning uchun tahlil avtomatik hisobga oladi
-CREATE TABLE IF NOT EXISTS sales(
+  balance BIGINT NOT NULL DEFAULT 0,                        -- nasiya (qarz); faqat customer_ledger orqali o'zgaradi
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  CONSTRAINT chk_balance_nonneg CHECK(balance >= 0));
+
+-- Buyurtma
+CREATE TABLE purchase_orders(
+  id BIGSERIAL PRIMARY KEY, supplier_id BIGINT REFERENCES suppliers(id),
+  status TEXT NOT NULL DEFAULT 'ordered' CHECK(status IN ('ordered','received','cancelled')),
+  created_by BIGINT NOT NULL REFERENCES users(id), total BIGINT NOT NULL CHECK(total >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), closed_at TIMESTAMPTZ);
+CREATE TABLE po_items(
+  id BIGSERIAL PRIMARY KEY, po_id BIGINT NOT NULL REFERENCES purchase_orders(id),
+  product_id BIGINT NOT NULL REFERENCES products(id), qty DOUBLE PRECISION NOT NULL CHECK(qty > 0),
+  cost BIGINT NOT NULL CHECK(cost >= 0), line_total BIGINT NOT NULL CHECK(line_total >= 0), UNIQUE(po_id, product_id));
+
+-- Kirim: receipt (qo'lda/buyurtma bo'yicha), opening (boshlang'ich qoldiq), reversal (storno)
+CREATE TABLE receipts(
+  id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
+  kind TEXT NOT NULL DEFAULT 'receipt' CHECK(kind IN ('receipt','opening','reversal')),
+  supplier_id BIGINT REFERENCES suppliers(id),
+  po_id BIGINT REFERENCES purchase_orders(id),              -- buyurtma bo'yicha kirim
+  ref_receipt_id BIGINT REFERENCES receipts(id),            -- storno -> asl kirim
+  note TEXT DEFAULT '', total BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((kind = 'reversal') = (ref_receipt_id IS NOT NULL)),
+  CHECK (po_id IS NULL OR kind = 'receipt'),
+  CHECK (kind = 'reversal' OR total >= 0), CHECK (kind <> 'reversal' OR total <= 0));
+CREATE UNIQUE INDEX uq_receipt_reversal ON receipts(ref_receipt_id) WHERE ref_receipt_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_receipt_po ON receipts(po_id) WHERE po_id IS NOT NULL;
+CREATE TABLE receipt_items(
+  id BIGSERIAL PRIMARY KEY, receipt_id BIGINT NOT NULL REFERENCES receipts(id),
+  product_id BIGINT NOT NULL REFERENCES products(id), qty DOUBLE PRECISION NOT NULL CHECK(qty <> 0),
+  cost BIGINT NOT NULL CHECK(cost >= 0), line_total BIGINT NOT NULL, UNIQUE(receipt_id, product_id));
+
+-- Sotuv: sale | return (qaytarish: manfiy qatorlar, asl sotuvga bog'langan)
+CREATE TABLE sales(
   id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
   kind TEXT NOT NULL DEFAULT 'sale' CHECK(kind IN ('sale','return')),
   ref_sale_id BIGINT REFERENCES sales(id), customer_id BIGINT REFERENCES customers(id),
-  discount BIGINT NOT NULL DEFAULT 0, total BIGINT NOT NULL, paid BIGINT NOT NULL DEFAULT 0,
-  method TEXT NOT NULL DEFAULT 'cash', created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS sale_items(
+  discount BIGINT NOT NULL DEFAULT 0 CHECK(discount >= 0), total BIGINT NOT NULL, paid BIGINT NOT NULL DEFAULT 0 CHECK(paid >= 0),
+  method TEXT NOT NULL DEFAULT 'cash' CHECK(method IN ('cash','card','transfer')), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((kind = 'sale' AND ref_sale_id IS NULL) OR (kind = 'return' AND ref_sale_id IS NOT NULL)),
+  CHECK (kind = 'return' OR (total >= 0 AND paid <= total)),
+  CHECK (kind = 'sale' OR (total <= 0 AND paid = 0 AND discount = 0)));
+CREATE TABLE sale_items(
   id BIGSERIAL PRIMARY KEY, sale_id BIGINT NOT NULL REFERENCES sales(id),
   product_id BIGINT NOT NULL REFERENCES products(id), orig_item_id BIGINT REFERENCES sale_items(id),
-  qty DOUBLE PRECISION NOT NULL, price BIGINT NOT NULL, line_total BIGINT NOT NULL, cost BIGINT NOT NULL);
-CREATE TABLE IF NOT EXISTS receipts(
-  id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id),
-  supplier_id BIGINT REFERENCES suppliers(id), note TEXT DEFAULT '', total BIGINT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS receipt_items(
-  id BIGSERIAL PRIMARY KEY, receipt_id BIGINT NOT NULL REFERENCES receipts(id),
-  product_id BIGINT NOT NULL REFERENCES products(id), qty DOUBLE PRECISION NOT NULL, cost BIGINT NOT NULL);
-CREATE TABLE IF NOT EXISTS purchase_orders(
-  id BIGSERIAL PRIMARY KEY, supplier_id BIGINT REFERENCES suppliers(id),
-  status TEXT NOT NULL DEFAULT 'ordered' CHECK(status IN ('ordered','received','cancelled')),
-  created_by BIGINT NOT NULL REFERENCES users(id), total BIGINT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), closed_at TIMESTAMPTZ);
-CREATE TABLE IF NOT EXISTS po_items(
-  id BIGSERIAL PRIMARY KEY, po_id BIGINT NOT NULL REFERENCES purchase_orders(id),
-  product_id BIGINT NOT NULL REFERENCES products(id), qty DOUBLE PRECISION NOT NULL, cost BIGINT NOT NULL);
-CREATE TABLE IF NOT EXISTS stock_moves(
+  qty DOUBLE PRECISION NOT NULL CHECK(qty <> 0), price BIGINT NOT NULL CHECK(price >= 0),
+  line_total BIGINT NOT NULL, cost BIGINT NOT NULL CHECK(cost >= 0));
+
+-- Ombor daftari: har bir harakat aynan bitta hujjatga bog'langan (yo'qdan bor bo'lmaydi)
+CREATE TABLE stock_moves(
   id BIGSERIAL PRIMARY KEY, product_id BIGINT NOT NULL REFERENCES products(id),
-  type TEXT NOT NULL, qty DOUBLE PRECISION NOT NULL, ref_id BIGINT, user_id BIGINT,
+  type TEXT NOT NULL CHECK(type IN ('sale','return','receipt','purchase','opening','receipt_reversal')),
+  qty DOUBLE PRECISION NOT NULL CHECK(qty <> 0),
+  sale_id BIGINT REFERENCES sales(id), receipt_id BIGINT REFERENCES receipts(id),
+  user_id BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((type IN ('sale','return') AND sale_id IS NOT NULL AND receipt_id IS NULL)
+      OR (type NOT IN ('sale','return') AND receipt_id IS NOT NULL AND sale_id IS NULL)));
+
+-- Mijoz qarz hujjati va daftari
+CREATE TABLE debt_payments(
+  id BIGSERIAL PRIMARY KEY, customer_id BIGINT NOT NULL REFERENCES customers(id),
+  user_id BIGINT NOT NULL REFERENCES users(id), amount BIGINT NOT NULL CHECK(amount > 0),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
-CREATE INDEX IF NOT EXISTS idx_items_sale ON sale_items(sale_id);
-CREATE INDEX IF NOT EXISTS idx_items_prod ON sale_items(product_id);
-CREATE INDEX IF NOT EXISTS idx_items_orig ON sale_items(orig_item_id);
-CREATE INDEX IF NOT EXISTS idx_receipt_items_prod ON receipt_items(product_id);
+CREATE TABLE customer_ledger(
+  id BIGSERIAL PRIMARY KEY, customer_id BIGINT NOT NULL REFERENCES customers(id),
+  kind TEXT NOT NULL CHECK(kind IN ('sale_debt','payment','return_credit')), amount BIGINT NOT NULL,
+  sale_id BIGINT REFERENCES sales(id), debt_payment_id BIGINT REFERENCES debt_payments(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((kind = 'sale_debt' AND amount > 0 AND sale_id IS NOT NULL AND debt_payment_id IS NULL)
+      OR (kind = 'payment' AND amount < 0 AND debt_payment_id IS NOT NULL AND sale_id IS NULL)
+      OR (kind = 'return_credit' AND amount < 0 AND sale_id IS NOT NULL AND debt_payment_id IS NULL)));
 
--- Holat (aktiv/noaktiv): ma'lumot o'chirilmaydi, faqat noaktiv qilinadi
-ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
-ALTER TABLE customers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
--- Sessiya o'chirilmaydi, bekor qilinadi
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE;
--- Kirimni tuzatish: storno hujjati (kind='reversal'), asl hujjatga bog'langan
-ALTER TABLE receipts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'receipt' CHECK(kind IN ('receipt','reversal'));
-ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ref_receipt_id BIGINT REFERENCES receipts(id);
-CREATE UNIQUE INDEX IF NOT EXISTS uq_receipt_reversal ON receipts(ref_receipt_id) WHERE ref_receipt_id IS NOT NULL;
-
--- O'zgarishlar tarixi (SAP: CDHDR/CDPOS): kim, qachon, qaysi maydonni, eski -> yangi
-CREATE TABLE IF NOT EXISTS change_log(
+-- O'zgarishlar tarixi (SAP: CDHDR/CDPOS)
+CREATE TABLE change_log(
   id BIGSERIAL PRIMARY KEY, table_name TEXT NOT NULL, record_id BIGINT NOT NULL,
   action CHAR(1) NOT NULL CHECK(action IN ('I','U')), field TEXT, old_value TEXT, new_value TEXT,
   user_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS idx_change_log_rec ON change_log(table_name, record_id);
+
+CREATE INDEX idx_sales_created ON sales(created_at);
+CREATE INDEX idx_sales_ref ON sales(ref_sale_id);
+CREATE INDEX idx_items_sale ON sale_items(sale_id);
+CREATE INDEX idx_items_prod ON sale_items(product_id);
+CREATE INDEX idx_items_orig ON sale_items(orig_item_id);
+CREATE INDEX idx_receipt_items_rec ON receipt_items(receipt_id);
+CREATE INDEX idx_receipt_items_prod ON receipt_items(product_id);
+CREATE INDEX idx_po_items_po ON po_items(po_id);
+CREATE INDEX idx_moves_prod ON stock_moves(product_id);
+CREATE INDEX idx_moves_sale ON stock_moves(sale_id);
+CREATE INDEX idx_moves_receipt ON stock_moves(receipt_id);
+CREATE INDEX idx_ledger_cust ON customer_ledger(customer_id);
+CREATE INDEX idx_ledger_sale ON customer_ledger(sale_id);
+CREATE INDEX idx_change_log_rec ON change_log(table_name, record_id);
 `;
 
 // ---- Ma'lumot yaxlitligi (SAP standarti) ----
-// 1) Hech qaysi jadvaldan qator o'chirib bo'lmaydi (DELETE/TRUNCATE) — DB darajasida.
-// 2) Hujjatlar (sotuv, kirim, harakatlar, to'lovlar...) yozilgach o'zgarmaydi — faqat storno/qaytarish hujjati bilan tuzatiladi.
-// 3) Asosiy ma'lumotlar (mahsulot, mijoz, yetkazuvchi, foydalanuvchi) o'zgarishi change_log ga yoziladi.
-const ALL_TABLES = ['users', 'sessions', 'login_attempts', 'products', 'suppliers', 'customers', 'debt_payments', 'sales', 'sale_items',
-  'receipts', 'receipt_items', 'purchase_orders', 'po_items', 'stock_moves', 'change_log'];
-const DOCUMENTS = ['debt_payments', 'sales', 'sale_items', 'receipts', 'receipt_items', 'po_items', 'stock_moves', 'change_log'];
+// 1) Hech qaysi jadvaldan qator o'chirib bo'lmaydi (DELETE/TRUNCATE).
+// 2) Hujjatlar yozilgach o'zgarmaydi — faqat storno/qaytarish bilan tuziladi.
+// 3) Qoldiq (products.stock) va qarz (customers.balance) FAQAT daftar yozuvlari orqali o'zgaradi.
+// 4) Har bir hujjat qatorlari, ombor harakatlari va daftar yozuvlari bilan bir-biriga TENG bo'lishi shart (tranzaksiya
+//    oxirida tekshiriladi): yo'qdan bor ham, bordan yo'q ham bo'lmaydi.
+// 5) Asosiy ma'lumotlar o'zgarishi change_log ga yoziladi.
+const ALL_TABLES = ['users', 'sessions', 'login_attempts', 'products', 'suppliers', 'customers', 'purchase_orders', 'po_items', 'receipts',
+  'receipt_items', 'sales', 'sale_items', 'stock_moves', 'debt_payments', 'customer_ledger', 'change_log'];
+const DOCUMENTS = ['po_items', 'receipts', 'receipt_items', 'sales', 'sale_items', 'stock_moves', 'debt_payments', 'customer_ledger', 'change_log'];
 const MASTER = ['users', 'products', 'suppliers', 'customers', 'purchase_orders'];
+const ERR = "USING ERRCODE = 'integrity_constraint_violation'";
 
 export const INTEGRITY = `
-CREATE OR REPLACE FUNCTION forbid_delete() RETURNS trigger AS $$
-BEGIN RAISE EXCEPTION 'Ma''lumotni o''chirib bo''lmaydi (% jadvali): noaktiv holatga o''tkazing', TG_TABLE_NAME USING ERRCODE = 'integrity_constraint_violation'; END
+CREATE FUNCTION forbid_delete() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'Ma''lumotni o''chirib bo''lmaydi (% jadvali): noaktiv holatga o''tkazing', TG_TABLE_NAME ${ERR}; END
+$$ LANGUAGE plpgsql;
+CREATE FUNCTION forbid_update() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'Hujjat o''zgartirilmaydi (% jadvali): storno/qaytarish hujjati yarating', TG_TABLE_NAME ${ERR}; END
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION forbid_update() RETURNS trigger AS $$
-BEGIN RAISE EXCEPTION 'Hujjat o''zgartirilmaydi (% jadvali): storno/qaytarish hujjati yarating', TG_TABLE_NAME USING ERRCODE = 'integrity_constraint_violation'; END
-$$ LANGUAGE plpgsql;
-
--- Buyurtma: faqat 'ordered' -> 'received'/'cancelled' (status va yopilish vaqti); qolgan maydonlar o'zgarmaydi
-CREATE OR REPLACE FUNCTION guard_purchase_order() RETURNS trigger AS $$
+-- Buyurtma: faqat 'ordered' -> 'received' (kirim hujjati bilan) yoki 'cancelled'
+CREATE FUNCTION guard_purchase_order() RETURNS trigger AS $$
 BEGIN
-  IF OLD.status <> 'ordered' THEN RAISE EXCEPTION 'Yopilgan buyurtma o''zgartirilmaydi' USING ERRCODE = 'integrity_constraint_violation'; END IF;
+  IF OLD.status <> 'ordered' THEN RAISE EXCEPTION 'Yopilgan buyurtma o''zgartirilmaydi' ${ERR}; END IF;
   IF (to_jsonb(NEW) - 'status' - 'closed_at') IS DISTINCT FROM (to_jsonb(OLD) - 'status' - 'closed_at') THEN
-    RAISE EXCEPTION 'Buyurtma tarkibi o''zgartirilmaydi' USING ERRCODE = 'integrity_constraint_violation'; END IF;
+    RAISE EXCEPTION 'Buyurtma tarkibi o''zgartirilmaydi' ${ERR}; END IF;
+  IF NEW.status = 'received' AND NOT EXISTS (SELECT 1 FROM receipts WHERE po_id = NEW.id AND kind = 'receipt') THEN
+    RAISE EXCEPTION 'Kirim hujjatisiz buyurtmani "qabul qilindi" qilib bo''lmaydi (#%)', NEW.id ${ERR}; END IF;
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION log_changes() RETURNS trigger AS $$
+-- Qoldiq va qarz faqat daftar yozuvi orqali o'zgaradi
+CREATE FUNCTION guard_stock() RETURNS trigger AS $$
+BEGIN
+  IF NEW.stock IS DISTINCT FROM OLD.stock AND COALESCE(current_setting('app.ledger', true), '') <> '1' THEN
+    RAISE EXCEPTION 'Qoldiq to''g''ridan-to''g''ri o''zgartirilmaydi: ombor harakati (stock_moves) hujjati kerak' ${ERR}; END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE FUNCTION guard_balance() RETURNS trigger AS $$
+BEGIN
+  IF NEW.balance IS DISTINCT FROM OLD.balance AND COALESCE(current_setting('app.ledger', true), '') <> '1' THEN
+    RAISE EXCEPTION 'Qarz to''g''ridan-to''g''ri o''zgartirilmaydi: mijoz daftari (customer_ledger) yozuvi kerak' ${ERR}; END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE FUNCTION apply_stock_move() RETURNS trigger AS $$
+BEGIN
+  PERFORM set_config('app.ledger', '1', true);
+  UPDATE products SET stock = ROUND((stock + NEW.qty)::numeric, 6)::float8 WHERE id = NEW.product_id;
+  PERFORM set_config('app.ledger', '', true);
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE FUNCTION apply_ledger_entry() RETURNS trigger AS $$
+BEGIN
+  PERFORM set_config('app.ledger', '1', true);
+  UPDATE customers SET balance = balance + NEW.amount WHERE id = NEW.customer_id;
+  PERFORM set_config('app.ledger', '', true);
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+-- Qator-darajali tekshiruv: qaytarish asl sotuv qatoriga mos va uning qoldig'idan oshmaydi
+CREATE FUNCTION validate_sale_item() RETURNS trigger AS $$
+DECLARE s sales%ROWTYPE; o sale_items%ROWTYPE; returned float8; returned_sum bigint;
+BEGIN
+  SELECT * INTO s FROM sales WHERE id = NEW.sale_id;
+  IF s.kind = 'sale' THEN
+    IF NEW.orig_item_id IS NOT NULL OR NEW.qty <= 0 OR NEW.line_total < 0 THEN RAISE EXCEPTION 'Sotuv qatori noto''g''ri (#%)', NEW.sale_id ${ERR}; END IF;
+  ELSE
+    IF NEW.orig_item_id IS NULL OR NEW.qty >= 0 OR NEW.line_total > 0 THEN RAISE EXCEPTION 'Qaytarish qatori asl sotuv qatoriga bog''lanishi va manfiy bo''lishi shart' ${ERR}; END IF;
+    SELECT * INTO o FROM sale_items WHERE id = NEW.orig_item_id FOR UPDATE;
+    IF NOT FOUND OR o.sale_id <> s.ref_sale_id OR o.product_id <> NEW.product_id THEN RAISE EXCEPTION 'Qaytarish qatori asl sotuvga mos emas' ${ERR}; END IF;
+    SELECT COALESCE(-SUM(qty), 0), COALESCE(-SUM(line_total), 0) INTO returned, returned_sum FROM sale_items WHERE orig_item_id = o.id;
+    IF returned - NEW.qty > o.qty + 1e-6 OR returned_sum - NEW.line_total > o.line_total THEN
+      RAISE EXCEPTION 'Qaytarish sotilgan miqdor/summadan oshib ketdi' ${ERR}; END IF;
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+-- Hujjat-darajali tekshiruvlar (tranzaksiya oxirida, DEFERRED)
+CREATE FUNCTION check_sale_doc() RETURNS trigger AS $$
+DECLARE s sales%ROWTYPE; n int; sum_lines bigint; bad int; debt bigint; credit bigint;
+BEGIN
+  SELECT * INTO s FROM sales WHERE id = NEW.id;
+  SELECT COUNT(*), COALESCE(SUM(line_total), 0) INTO n, sum_lines FROM sale_items WHERE sale_id = s.id;
+  IF n = 0 THEN RAISE EXCEPTION 'Sotuv hujjatida qatorlar yo''q (#%)', s.id ${ERR}; END IF;
+  IF sum_lines <> s.total THEN RAISE EXCEPTION 'Sotuv jami (%) qatorlar yig''indisiga (%) teng emas (#%)', s.total, sum_lines, s.id ${ERR}; END IF;
+  SELECT COUNT(*) INTO bad FROM (SELECT product_id, SUM(qty) q FROM sale_items WHERE sale_id = s.id GROUP BY product_id) i
+    FULL JOIN (SELECT product_id, SUM(-qty) q FROM stock_moves WHERE sale_id = s.id GROUP BY product_id) m USING (product_id)
+    WHERE abs(COALESCE(i.q, 0) - COALESCE(m.q, 0)) > 1e-6;
+  IF bad > 0 THEN RAISE EXCEPTION 'Sotuv qatorlari ombor harakatlariga mos emas (#%)', s.id ${ERR}; END IF;
+  IF s.kind = 'sale' THEN
+    SELECT COALESCE(SUM(amount), 0) INTO debt FROM customer_ledger WHERE sale_id = s.id AND kind = 'sale_debt';
+    IF debt <> s.total - s.paid THEN RAISE EXCEPTION 'Nasiya summasi mijoz daftariga mos emas (#%)', s.id ${ERR}; END IF;
+    IF s.total > s.paid AND s.customer_id IS NULL THEN RAISE EXCEPTION 'Nasiya uchun mijoz kerak (#%)', s.id ${ERR}; END IF;
+  ELSE
+    SELECT COALESCE(-SUM(amount), 0) INTO credit FROM customer_ledger WHERE sale_id = s.id AND kind = 'return_credit';
+    IF credit > -s.total THEN RAISE EXCEPTION 'Qarzga qaytarilgan summa qaytarish summasidan oshib ketdi (#%)', s.id ${ERR}; END IF;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION check_receipt_doc() RETURNS trigger AS $$
+DECLARE r receipts%ROWTYPE; n int; sum_lines bigint; bad int; orig receipts%ROWTYPE; po purchase_orders%ROWTYPE;
+BEGIN
+  SELECT * INTO r FROM receipts WHERE id = NEW.id;
+  SELECT COUNT(*), COALESCE(SUM(line_total), 0) INTO n, sum_lines FROM receipt_items WHERE receipt_id = r.id;
+  IF n = 0 THEN RAISE EXCEPTION 'Kirim hujjatida qatorlar yo''q (#%)', r.id ${ERR}; END IF;
+  IF sum_lines <> r.total THEN RAISE EXCEPTION 'Kirim jami (%) qatorlar yig''indisiga (%) teng emas (#%)', r.total, sum_lines, r.id ${ERR}; END IF;
+  IF r.kind = 'reversal' THEN
+    SELECT COUNT(*) INTO bad FROM receipt_items WHERE receipt_id = r.id AND qty >= 0;
+  ELSE
+    SELECT COUNT(*) INTO bad FROM receipt_items WHERE receipt_id = r.id AND qty <= 0;
+  END IF;
+  IF bad > 0 THEN RAISE EXCEPTION 'Kirim qatorlari ishorasi hujjat turiga mos emas (#%)', r.id ${ERR}; END IF;
+  SELECT COUNT(*) INTO bad FROM (SELECT product_id, SUM(qty) q FROM receipt_items WHERE receipt_id = r.id GROUP BY product_id) i
+    FULL JOIN (SELECT product_id, SUM(qty) q FROM stock_moves WHERE receipt_id = r.id GROUP BY product_id) m USING (product_id)
+    WHERE abs(COALESCE(i.q, 0) - COALESCE(m.q, 0)) > 1e-6;
+  IF bad > 0 THEN RAISE EXCEPTION 'Kirim qatorlari ombor harakatlariga mos emas (#%)', r.id ${ERR}; END IF;
+  IF r.kind = 'reversal' THEN  -- storno asl kirimning aynan teskarisi
+    SELECT * INTO orig FROM receipts WHERE id = r.ref_receipt_id;
+    IF orig.kind <> 'receipt' OR orig.total <> -r.total THEN RAISE EXCEPTION 'Storno asl kirimga mos emas (#%)', r.id ${ERR}; END IF;
+    SELECT COUNT(*) INTO bad FROM (SELECT product_id, SUM(qty) q FROM receipt_items WHERE receipt_id = r.id GROUP BY product_id) i
+      FULL JOIN (SELECT product_id, SUM(-qty) q FROM receipt_items WHERE receipt_id = r.ref_receipt_id GROUP BY product_id) o USING (product_id)
+      WHERE abs(COALESCE(i.q, 0) - COALESCE(o.q, 0)) > 1e-6;
+    IF bad > 0 THEN RAISE EXCEPTION 'Storno qatorlari asl kirimga mos emas (#%)', r.id ${ERR}; END IF;
+  END IF;
+  IF r.po_id IS NOT NULL THEN  -- buyurtma bo'yicha kirim buyurtma qatorlariga teng
+    SELECT * INTO po FROM purchase_orders WHERE id = r.po_id;
+    IF po.supplier_id IS DISTINCT FROM r.supplier_id THEN RAISE EXCEPTION 'Kirim yetkazuvchisi buyurtmaga mos emas (#%)', r.id ${ERR}; END IF;
+    SELECT COUNT(*) INTO bad FROM (SELECT product_id, SUM(qty) q, SUM(line_total) t FROM receipt_items WHERE receipt_id = r.id GROUP BY product_id) i
+      FULL JOIN (SELECT product_id, SUM(qty) q, SUM(line_total) t FROM po_items WHERE po_id = r.po_id GROUP BY product_id) o USING (product_id)
+      WHERE abs(COALESCE(i.q, 0) - COALESCE(o.q, 0)) > 1e-6 OR COALESCE(i.t, 0) <> COALESCE(o.t, 0);
+    IF bad > 0 THEN RAISE EXCEPTION 'Kirim buyurtma qatorlariga mos emas (#%)', r.id ${ERR}; END IF;
+  END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION check_po_doc() RETURNS trigger AS $$
+DECLARE n int; sum_lines bigint;
+BEGIN
+  SELECT COUNT(*), COALESCE(SUM(line_total), 0) INTO n, sum_lines FROM po_items WHERE po_id = NEW.id;
+  IF n = 0 THEN RAISE EXCEPTION 'Buyurtmada qatorlar yo''q (#%)', NEW.id ${ERR}; END IF;
+  IF sum_lines <> NEW.total THEN RAISE EXCEPTION 'Buyurtma jami qatorlar yig''indisiga teng emas (#%)', NEW.id ${ERR}; END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION check_debt_payment() RETURNS trigger AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM customer_ledger WHERE debt_payment_id = NEW.id AND customer_id = NEW.customer_id AND amount = -NEW.amount AND kind = 'payment') THEN
+    RAISE EXCEPTION 'To''lov mijoz daftariga yozilmagan (#%)', NEW.id ${ERR}; END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION log_changes() RETURNS trigger AS $$
 DECLARE k text; o jsonb; n jsonb; uid bigint;
 BEGIN
   uid := NULLIF(current_setting('app.user_id', true), '')::bigint;
@@ -170,7 +346,7 @@ BEGIN
   END IF;
   o := to_jsonb(OLD); n := to_jsonb(NEW);
   FOR k IN SELECT jsonb_object_keys(n) LOOP
-    CONTINUE WHEN k IN ('stock', 'balance'); -- bular harakatlar daftaridan (stock_moves, sales) kelib chiqadi
+    CONTINUE WHEN k IN ('stock', 'balance'); -- bular daftardan (stock_moves, customer_ledger) kelib chiqadi
     IF o->k IS DISTINCT FROM n->k THEN
       INSERT INTO change_log(table_name, record_id, action, field, old_value, new_value, user_id)
       VALUES (TG_TABLE_NAME, NEW.id, 'U', k, CASE WHEN k = 'password_hash' THEN '***' ELSE o->>k END,
@@ -180,12 +356,37 @@ BEGIN
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 
-${ALL_TABLES.map((t) => `CREATE OR REPLACE TRIGGER trg_nodelete BEFORE DELETE ON ${t} FOR EACH STATEMENT EXECUTE FUNCTION forbid_delete();
-CREATE OR REPLACE TRIGGER trg_notruncate BEFORE TRUNCATE ON ${t} FOR EACH STATEMENT EXECUTE FUNCTION forbid_delete();`).join('\n')}
-${DOCUMENTS.map((t) => `CREATE OR REPLACE TRIGGER trg_immutable BEFORE UPDATE ON ${t} FOR EACH ROW EXECUTE FUNCTION forbid_update();`).join('\n')}
-CREATE OR REPLACE TRIGGER trg_po_guard BEFORE UPDATE ON purchase_orders FOR EACH ROW EXECUTE FUNCTION guard_purchase_order();
-${MASTER.map((t) => `CREATE OR REPLACE TRIGGER trg_audit AFTER INSERT OR UPDATE ON ${t} FOR EACH ROW EXECUTE FUNCTION log_changes();`).join('\n')}
+${ALL_TABLES.map((t) => `CREATE TRIGGER trg_nodelete BEFORE DELETE ON ${t} FOR EACH STATEMENT EXECUTE FUNCTION forbid_delete();
+CREATE TRIGGER trg_notruncate BEFORE TRUNCATE ON ${t} FOR EACH STATEMENT EXECUTE FUNCTION forbid_delete();`).join('\n')}
+${DOCUMENTS.map((t) => `CREATE TRIGGER trg_immutable BEFORE UPDATE ON ${t} FOR EACH ROW EXECUTE FUNCTION forbid_update();`).join('\n')}
+CREATE TRIGGER trg_po_guard BEFORE UPDATE ON purchase_orders FOR EACH ROW EXECUTE FUNCTION guard_purchase_order();
+CREATE TRIGGER trg_guard_stock BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION guard_stock();
+CREATE TRIGGER trg_guard_balance BEFORE UPDATE ON customers FOR EACH ROW EXECUTE FUNCTION guard_balance();
+CREATE TRIGGER trg_apply_move AFTER INSERT ON stock_moves FOR EACH ROW EXECUTE FUNCTION apply_stock_move();
+CREATE TRIGGER trg_apply_ledger AFTER INSERT ON customer_ledger FOR EACH ROW EXECUTE FUNCTION apply_ledger_entry();
+CREATE TRIGGER trg_validate_item BEFORE INSERT ON sale_items FOR EACH ROW EXECUTE FUNCTION validate_sale_item();
+CREATE CONSTRAINT TRIGGER trg_sale_doc AFTER INSERT ON sales DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_sale_doc();
+CREATE CONSTRAINT TRIGGER trg_receipt_doc AFTER INSERT ON receipts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_receipt_doc();
+CREATE CONSTRAINT TRIGGER trg_po_doc AFTER INSERT ON purchase_orders DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_po_doc();
+CREATE CONSTRAINT TRIGGER trg_debt_doc AFTER INSERT ON debt_payments DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_debt_payment();
+${MASTER.map((t) => `CREATE TRIGGER trg_audit AFTER INSERT OR UPDATE ON ${t} FOR EACH ROW EXECUTE FUNCTION log_changes();`).join('\n')}
 `;
+
+// Sxema versiyasi: SCHEMA/INTEGRITY o'zgarganda oshiring. Bir vaqtda bir nechta serverless nusxa ishga tushsa ham
+// migratsiya advisory lock ostida faqat bir marta bajariladi (tranzaksion DDL).
+export const SCHEMA_VERSION = 3;
+export async function migrate(db) {
+  await db.tx(async (t) => {
+    await t.q('SELECT pg_advisory_xact_lock(727001)');
+    await t.exec('CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value INT NOT NULL)');
+    const cur = (await t.one("SELECT value FROM schema_meta WHERE key='version'"))?.value ?? 0;
+    if (cur >= SCHEMA_VERSION) return;
+    if (cur > 0) throw new Error(`Baza sxemasi eski (v${cur}, kerak v${SCHEMA_VERSION}). Loyiha hali ishlab chiqarishga chiqmagan: bazani qayta yarating (Neon: yangi branch/baza yoki "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")`);
+    await t.exec(SCHEMA);
+    await t.exec(INTEGRITY);
+    await t.run("INSERT INTO schema_meta(key,value) VALUES('version',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [SCHEMA_VERSION]);
+  });
+}
 
 export function hashPassword(pw) {
   const salt = randomBytes(16);
@@ -198,20 +399,6 @@ export function verifyPassword(pw, stored) {
 
 const isProd = () => !!process.env.VERCEL || process.env.NODE_ENV === 'production';
 
-// Sxema versiyasi: SCHEMA/INTEGRITY o'zgarganda oshiring. Bir vaqtda bir nechta serverless nusxa ishga tushsa ham
-// migratsiya advisory lock ostida faqat bir marta bajariladi (tranzaksion DDL).
-export const SCHEMA_VERSION = 2;
-export async function migrate(db) {
-  await db.tx(async (t) => {
-    await t.q('SELECT pg_advisory_xact_lock(727001)');
-    await t.exec('CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value INT NOT NULL)');
-    const cur = (await t.one("SELECT value FROM schema_meta WHERE key='version'"))?.value ?? 0;
-    if (cur >= SCHEMA_VERSION) return;
-    await t.exec(SCHEMA);
-    await t.exec(INTEGRITY);
-    await t.run("INSERT INTO schema_meta(key,value) VALUES('version',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [SCHEMA_VERSION]);
-  });
-}
 
 // Birinchi admin/sotuvchi. Ishlab chiqarishda parol env orqali majburiy (standart parol yo'q).
 export async function ensureDefaultUsers(db) {

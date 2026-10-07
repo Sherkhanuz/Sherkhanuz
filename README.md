@@ -37,6 +37,8 @@ npm test
 Sxemani oldindan yaratish: `DATABASE_URL=... npm run migrate`.
 
 ## Ma'lumot yaxlitligi (SAP tamoyillari)
+Batafsil hujjatlar zanjiri, diagramma va qoidalar: **[docs/HUJJATLAR_ZANJIRI.md](docs/HUJJATLAR_ZANJIRI.md)**.
+
 Ma'lumot **hech qachon o'chirilmaydi** — faqat **aktiv / noaktiv** holatga o'tadi. Bu qoidalar ilovada emas, **bazaning o'zida** (trigger) majburlanadi, shuning uchun xato yoki hujum ham ularni buzolmaydi.
 
 | Qoida | Qanday |
@@ -47,9 +49,12 @@ Ma'lumot **hech qachon o'chirilmaydi** — faqat **aktiv / noaktiv** holatga o't
 | Hujjatlar o'zgarmas | Sotuv, kirim, harakatlar, to'lovlar, buyurtma qatorlari yozilgach `UPDATE` rad etiladi. Buyurtmada faqat holat (`ordered` → `received`/`cancelled`) o'zgaradi |
 | Tuzatish — storno | Qaytarish (sotuv uchun) va kirim stornosi (admin) — asl hujjatga bog'langan **teskari hujjat**; ikki marta storno qilib bo'lmaydi |
 | O'zgarishlar tarixi | `change_log`: kim, qachon, qaysi maydon, eski → yangi (narx, tannarx, holat, ... parollar `***`). Admin → **Tarix** |
-| Qoldiq va qarz | `stock`/`balance` — hisoblangan qoldiq; asosi o'zgarmas daftar (`stock_moves`, `sales`, `debt_payments`) |
+| Hujjatlar zanjiri | Har bir hujjat bog'langan: buyurtma → kirim → storno; sotuv → qaytarish; to'lov. Hujjat jami = qatorlar, qatorlar = ombor harakatlari, nasiya = mijoz daftari (tranzaksiya oxirida baza tekshiradi). Admin → **Hujjatlar** |
+| Qoldiq va qarz | `stock`/`balance` faqat daftar (`stock_moves`, `customer_ledger`) orqali o'zgaradi; to'g'ridan-to'g'ri `UPDATE` bazada rad etiladi, manfiy bo'lmaydi |
+| Nazorat | Admin → Hujjatlar → **Tekshirish**: 11 ta solishtirish hisoboti (`/api/admin/integrity`) |
 
 Qo'shimcha himoya (tavsiya): ishlab chiqarishda ilova uchun alohida DB roli oching va unga `DELETE`/`TRUNCATE`/`TRIGGER` huquqini bermang — trigger'ni o'chirish ham mumkin bo'lmaydi.
+**Eslatma (v3 sxema):** loyiha hali ishlab chiqarishga chiqmagani uchun eski (v2) bazadan migratsiya yo'q — bazani qayta yarating (`DROP SCHEMA public CASCADE; CREATE SCHEMA public;` yoki yangi Neon baza/branch).
 Cheklov: hujjat raqamlari ketma-ket (gapless) kafolatlanmaydi (bekor qilingan tranzaksiya raqam "teshigi" qoldirishi mumkin).
 
 ## Arxitektura
@@ -57,7 +62,8 @@ Cheklov: hujjat raqamlari ketma-ket (gapless) kafolatlanmaydi (bekor qilingan tr
 public/            statik UI (vanilla JS) — Vercel CDN
 api/index.js       yagona serverless funksiya (vercel.json: /api/* -> shu yerga)
 app.js             REST API (marshrutlar, rol tekshiruvi, hisob-kitob)
-db.js              Postgres qatlami: pg (Neon) yoki PGlite (lokal), sxema + yaxlitlik triggerlari, versiyali migratsiya (advisory lock)
+db.js              Postgres qatlami: pg (Neon) yoki PGlite (lokal), sxema + yaxlitlik triggerlari (hujjatlar zanjiri), versiyali migratsiya (advisory lock)
+docs/              BOZOR_TAHLILI.md, HUJJATLAR_ZANJIRI.md
 seed.js, migrate.js, test/
 ```
 - Soatlik/kunlik tahlil `TZ_NAME` (standart `Asia/Tashkent`) bo'yicha hisoblanadi.
@@ -71,4 +77,4 @@ Oxirgi 30 kundagi o'rtacha kunlik sotuv bo'yicha mahsulot taklifga tushadi, agar
 Miqdor = `max(min×2, kunlik_sotuv×14) − qoldiq − yo'ldagi buyurtma`. Yetkazib beruvchi — oxirgi kirimdagi yetkazuvchi, narx — oxirgi tannarx.
 
 ## Hali yo'q
-Soliq/fiskal integratsiya, ko'p filial, offline rejim, inventarizatsiya. Bozor bilan taqqoslash: [docs/BOZOR_TAHLILI.md](docs/BOZOR_TAHLILI.md).
+Soliq/fiskal integratsiya, ko'p filial, offline rejim, inventarizatsiya. Bozor bilan taqqoslash: [docs/BOZOR_TAHLILI.md](docs/BOZOR_TAHLILI.md). Hujjatlar zanjiri: [docs/HUJJATLAR_ZANJIRI.md](docs/HUJJATLAR_ZANJIRI.md).

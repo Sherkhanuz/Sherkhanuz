@@ -45,26 +45,14 @@ async function bulk(t, table, cols, rows, ret = false) {
 
 await db.tx(async (t) => {
   const supIds = await bulk(t, 'suppliers', ['name', 'phone'], [['Orient Savdo', '+998901110000'], ['Baraka Opt', '+998902220000'], ['Fresh Group', '+998903330000']], true);
-  const custIds = await bulk(t, 'customers', ['name', 'phone', 'balance'], [['Karim aka', '+998909990001', 0], ['Dilnoza opa', '+998909990002', 0]], true);
-  const ids = await bulk(t, 'products', ['sku', 'name', 'category', 'unit', 'price', 'cost', 'stock', 'min_stock'],
-    P.map((p, i) => [ean13('4600000000' + String(100 + i).slice(-2)), p[0], p[1], p[2], p[3], p[4], 0, p[5]]), true);
+  const custIds = await bulk(t, 'customers', ['name', 'phone'], [['Karim aka', '+998909990001'], ['Dilnoza opa', '+998909990002']], true);
+  const ids = await bulk(t, 'products', ['sku', 'name', 'category', 'unit', 'price', 'cost', 'min_stock'],
+    P.map((p, i) => [ean13('4600000000' + String(100 + i).slice(-2)), p[0], p[1], p[2], p[3], p[4], p[5]]), true);
 
+  // 1) Sotuvlar xotirada tuziladi (qoldiq tarixdan kelib chiqadi: hech narsa "yo'qdan" paydo bo'lmaydi)
   const now = Date.now();
-  const stock = P.map(() => 0);
-  const day0 = new Date(now - 31 * 864e5).toISOString();
-  // Boshlang'ich kirim: yetkazib beruvchi bo'yicha
-  for (let s = 0; s < 3; s++) {
-    const mine = P.map((p, i) => [p, i]).filter(([p]) => p[7] === s);
-    const q = mine.map(([p]) => Math.ceil(p[6] * 32 + 5));
-    const total = mine.reduce((a, [p], k) => a + q[k] * p[4], 0); // hujjat o'zgarmas: jami oldindan hisoblanadi
-    const [rid] = await bulk(t, 'receipts', ['user_id', 'supplier_id', 'note', 'total', 'created_at'], [[seller, supIds[s], 'Boshlang\'ich qoldiq', total, day0]], true);
-    const items = mine.map(([p, i], k) => { stock[i] += q[k]; return [rid, ids[i], q[k], p[4]]; });
-    await bulk(t, 'receipt_items', ['receipt_id', 'product_id', 'qty', 'cost'], items);
-    await bulk(t, 'stock_moves', ['product_id', 'type', 'qty', 'ref_id', 'user_id', 'created_at'], items.map((x) => [x[1], 'receipt', x[2], rid, seller, day0]));
-  }
-
-  // Sotuvlar xotirada tuziladi, keyin partiyalab yoziladi
-  const sales = []; const lines = [];
+  const iso = (ms) => new Date(ms).toISOString();
+  const sales = [];
   for (let d = 29; d >= 0; d--) {
     const dayStart = new Date(now - d * 864e5); dayStart.setUTCHours(0, 0, 0, 0);
     const orders = 40 + rnd(25) + (d % 7 === 0 ? 20 : 0);
@@ -78,29 +66,37 @@ await db.tx(async (t) => {
         if (used.has(i) || Math.random() * 45 > P[i][6] + 6) continue;
         used.add(i); mine.push({ i, qty: 1 + rnd(2) });
       }
-      if (!mine.length) continue;
-      const total = mine.reduce((a, l) => a + l.qty * P[l.i][3], 0);
-      sales.push({ at: new Date(ms).toISOString(), total, mine, method: ['cash', 'card'][rnd(2)] });
+      if (mine.length) sales.push({ at: iso(ms), mine, method: ['cash', 'card'][rnd(2)], customer: null, paid: null });
     }
   }
-  const saleIds = await bulk(t, 'sales', ['user_id', 'total', 'paid', 'method', 'created_at'], sales.map((s) => [seller, s.total, s.total, s.method, s.at]), true);
-  sales.forEach((s, k) => s.mine.forEach((l) => {
-    stock[l.i] -= l.qty;
-    lines.push({ sale: saleIds[k], i: l.i, qty: l.qty, at: s.at });
-  }));
-  await bulk(t, 'sale_items', ['sale_id', 'product_id', 'qty', 'price', 'line_total', 'cost'], lines.map((l) => [l.sale, ids[l.i], l.qty, P[l.i][3], l.qty * P[l.i][3], P[l.i][4]]));
-  await bulk(t, 'stock_moves', ['product_id', 'type', 'qty', 'ref_id', 'user_id', 'created_at'], lines.map((l) => [ids[l.i], 'sale', -l.qty, l.sale, seller, l.at]));
+  // Nasiya demosi: Karim akaga 5 dona yog' (120 000 so'm), to'lanmagan
+  sales.push({ at: iso(now - 864e5), mine: [{ i: 2, qty: 5 }], method: 'cash', customer: custIds[0], paid: 0 });
+  for (const s of sales) { s.total = s.mine.reduce((a, l) => a + l.qty * P[l.i][3], 0); if (s.paid === null) s.paid = s.total; }
+  const sold = P.map(() => 0);
+  sales.forEach((s) => s.mine.forEach((l) => { sold[l.i] += l.qty; }));
 
-  // Bir nechta nasiya: bugun Karim akaga 120 000 so'mlik qarz
-  await t.run('UPDATE customers SET balance=120000 WHERE id=?', [custIds[0]]);
-
-  // Qoldiqlarni yozish; ba'zilari ataylab kam (xarid taklifi demosi uchun)
-  for (const [i, id] of ids.entries()) {
-    const want = i in LOW ? LOW[i] : Math.max(stock[i], P[i][5] + 5);
-    const diff = want - stock[i];
-    await t.run('UPDATE products SET stock=? WHERE id=?', [want, id]);
-    if (diff) await t.run('INSERT INTO stock_moves(product_id,type,qty,user_id) VALUES(?,?,?,?)', [id, 'adjust', diff, seller]);
+  // 2) Boshlang'ich kirim (31 kun oldin), yetkazib beruvchi bo'yicha: qoldiq = sotilgan + hozirgi maqsad qoldiq
+  const day0 = iso(now - 31 * 864e5);
+  const finalStock = P.map((p, i) => (i in LOW ? LOW[i] : p[5] + 5 + rnd(20)));
+  const recIds = {}, recMoves = [];
+  for (let sp = 0; sp < 3; sp++) {
+    const mine = P.map((p, i) => [p, i]).filter(([p]) => p[7] === sp);
+    const lines = mine.map(([p, i]) => ({ i, qty: sold[i] + finalStock[i], cost: p[4] }));
+    const total = lines.reduce((a, l) => a + l.qty * l.cost, 0); // hujjat o'zgarmas: jami oldindan
+    const [rid] = await bulk(t, 'receipts', ['user_id', 'supplier_id', 'note', 'total', 'created_at'], [[seller, supIds[sp], 'Boshlang\'ich kirim', total, day0]], true);
+    await bulk(t, 'receipt_items', ['receipt_id', 'product_id', 'qty', 'cost', 'line_total'], lines.map((l) => [rid, ids[l.i], l.qty, l.cost, l.qty * l.cost]));
+    lines.forEach((l) => recMoves.push([ids[l.i], 'receipt', l.qty, null, rid, seller, day0]));
   }
+  await bulk(t, 'stock_moves', ['product_id', 'type', 'qty', 'sale_id', 'receipt_id', 'user_id', 'created_at'], recMoves);
+
+  // 3) Sotuv hujjatlari, qatorlari, ombor harakatlari va mijoz daftari
+  const saleIds = await bulk(t, 'sales', ['user_id', 'customer_id', 'total', 'paid', 'method', 'created_at'], sales.map((s) => [seller, s.customer, s.total, s.paid, s.method, s.at]), true);
+  const lines = [];
+  sales.forEach((s, k) => s.mine.forEach((l) => lines.push({ sale: saleIds[k], i: l.i, qty: l.qty, at: s.at })));
+  await bulk(t, 'sale_items', ['sale_id', 'product_id', 'qty', 'price', 'line_total', 'cost'], lines.map((l) => [l.sale, ids[l.i], l.qty, P[l.i][3], l.qty * P[l.i][3], P[l.i][4]]));
+  await bulk(t, 'stock_moves', ['product_id', 'type', 'qty', 'sale_id', 'receipt_id', 'user_id', 'created_at'], lines.map((l) => [ids[l.i], 'sale', -l.qty, l.sale, null, seller, l.at]));
+  const credit = sales.map((s, k) => [s, k]).filter(([s]) => s.paid < s.total);
+  await bulk(t, 'customer_ledger', ['customer_id', 'kind', 'amount', 'sale_id', 'created_at'], credit.map(([s, k]) => [s.customer, 'sale_debt', s.total - s.paid, saleIds[k], s.at]));
 });
 console.log('Demo ma\'lumot yuklandi.');
 await db.close();
