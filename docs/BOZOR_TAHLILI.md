@@ -47,6 +47,7 @@
 | Mahsulot bo'yicha tahlil | ⚠️ | ✅ | ✅ (top, foyda, mahsulot filtri) |
 | Kam qolgan mahsulotga xarid taklifi | ❌ (faqat ogohlantirish) | ✅ | ✅ sotuv tezligiga asoslangan, yetkazuvchi bo'yicha guruhlangan |
 | Buyurtma → qabul → avto kirim | ❌ | ✅ | ✅ |
+| Yetkazuvchi avansi / hisob-kitobi, kassa, foyda-zarar (xarajat, brak bilan), o'rtacha tannarx | ⚠️ ko'pincha faqat tushum | ✅ (Odoo, 1С, МойСклад) | ✅ ([batafsil](../README.md#moliya-foyda-daromad-kassa)) |
 | Hujjatlar zanjiri (document flow), o'chirmaslik, storno, audit | ❌ | ✅ (SAP, Odoo, 1С — qisman) | ✅ ([batafsil](HUJJATLAR_ZANJIRI.md)) |
 | Shtrixkod / chek printer | ✅ | ✅ | ✅ (klaviatura-skaner + brauzer orqali chop etish) |
 | Ko'p filial / ombor | ❌ | ✅ | ❌ |

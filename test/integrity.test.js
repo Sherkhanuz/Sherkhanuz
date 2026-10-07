@@ -24,6 +24,7 @@ before(async () => {
   base = `http://127.0.0.1:${srv.address().port}`;
   await call('a', 'POST', '/api/login', { username: 'admin', password: 'admin123' });
   await call('s', 'POST', '/api/login', { username: 'sotuvchi', password: 'sotuvchi123' });
+  await call('a', 'POST', '/api/admin/cash-operations', { kind: 'owner_deposit', amount: 1000000 }); // yetkazuvchisiz kirim kassadan to'lanadi
   pid = (await call('a', 'POST', '/api/products', { name: 'Non', sku: '1', price: 4000, cost: 3000, stock: 10, min_stock: 2 })).data.id;
   supId = (await call('a', 'POST', '/api/suppliers', { name: 'Opt' })).data.id;
   custId = (await call('s', 'POST', '/api/customers', { name: 'Karim' })).data.id;

@@ -104,3 +104,4 @@ body.scanning{overflow:hidden}
   .scanhero{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;min-height:58px;font-size:18px;font-weight:700;border-radius:14px;margin-bottom:12px}
   .scanbtn:not(.scanhero){display:none}
 }
+.fin-b td{font-weight:700;border-top:2px solid var(--line)}

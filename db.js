@@ -65,6 +65,8 @@ export async function openDb({ url = process.env.DATABASE_URL, dir = process.env
 //         ▼                                                                  
 //   Ombor daftari (stock_moves: har biri aynan bitta hujjatga FK) ──► products.stock (faqat daftar orqali)
 //   Mijoz daftari (customer_ledger: sotuv/to'lov/qaytarish) ──► customers.balance (faqat daftar orqali)
+//   Yetkazuvchi daftari (supplier_ledger: kirim/to'lov/qaytim) ── (+ qarzimiz, − yetkazuvchida avansimiz)
+//   Kassa daftari (cash_ledger: har bir pul harakati aynan bitta hujjatga FK) ──► cash_accounts.balance (naqd/karta/o'tkazma)
 // ============================================================================
 export const SCHEMA = `
 CREATE TABLE users(
@@ -110,6 +112,7 @@ CREATE TABLE receipts(
   supplier_id BIGINT REFERENCES suppliers(id),
   po_id BIGINT REFERENCES purchase_orders(id),              -- buyurtma bo'yicha kirim
   ref_receipt_id BIGINT REFERENCES receipts(id),            -- storno -> asl kirim
+  pay_method TEXT NOT NULL DEFAULT 'cash' CHECK(pay_method IN ('cash','card','transfer')), -- yetkazuvchisiz (naqd) xarid qaysi hisobdan to'langan
   note TEXT DEFAULT '', total BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   CHECK ((kind = 'reversal') = (ref_receipt_id IS NOT NULL)),
   CHECK (po_id IS NULL OR kind = 'receipt'),
@@ -137,20 +140,29 @@ CREATE TABLE sale_items(
   qty DOUBLE PRECISION NOT NULL CHECK(qty <> 0), price BIGINT NOT NULL CHECK(price >= 0),
   line_total BIGINT NOT NULL, cost BIGINT NOT NULL CHECK(cost >= 0));
 
+-- Hisobdan chiqarish (brak, yaroqlilik muddati, yo'qotish): zarar sifatida foydadan ayriladi
+CREATE TABLE writeoffs(
+  id BIGSERIAL PRIMARY KEY, product_id BIGINT NOT NULL REFERENCES products(id),
+  qty DOUBLE PRECISION NOT NULL CHECK(qty > 0), cost BIGINT NOT NULL CHECK(cost >= 0), total BIGINT NOT NULL CHECK(total >= 0),
+  reason TEXT NOT NULL CHECK(reason IN ('damaged','expired','lost','other')), note TEXT DEFAULT '',
+  user_id BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+
 -- Ombor daftari: har bir harakat aynan bitta hujjatga bog'langan (yo'qdan bor bo'lmaydi)
 CREATE TABLE stock_moves(
   id BIGSERIAL PRIMARY KEY, product_id BIGINT NOT NULL REFERENCES products(id),
-  type TEXT NOT NULL CHECK(type IN ('sale','return','receipt','purchase','opening','receipt_reversal')),
+  type TEXT NOT NULL CHECK(type IN ('sale','return','receipt','purchase','opening','receipt_reversal','writeoff')),
   qty DOUBLE PRECISION NOT NULL CHECK(qty <> 0),
-  sale_id BIGINT REFERENCES sales(id), receipt_id BIGINT REFERENCES receipts(id),
+  sale_id BIGINT REFERENCES sales(id), receipt_id BIGINT REFERENCES receipts(id), writeoff_id BIGINT REFERENCES writeoffs(id),
   user_id BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CHECK ((type IN ('sale','return') AND sale_id IS NOT NULL AND receipt_id IS NULL)
-      OR (type NOT IN ('sale','return') AND receipt_id IS NOT NULL AND sale_id IS NULL)));
+  CHECK ((type IN ('sale','return') AND sale_id IS NOT NULL AND receipt_id IS NULL AND writeoff_id IS NULL)
+      OR (type IN ('receipt','purchase','opening','receipt_reversal') AND receipt_id IS NOT NULL AND sale_id IS NULL AND writeoff_id IS NULL)
+      OR (type = 'writeoff' AND writeoff_id IS NOT NULL AND sale_id IS NULL AND receipt_id IS NULL)));
 
 -- Mijoz qarz hujjati va daftari
 CREATE TABLE debt_payments(
   id BIGSERIAL PRIMARY KEY, customer_id BIGINT NOT NULL REFERENCES customers(id),
   user_id BIGINT NOT NULL REFERENCES users(id), amount BIGINT NOT NULL CHECK(amount > 0),
+  method TEXT NOT NULL DEFAULT 'cash' CHECK(method IN ('cash','card','transfer')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE customer_ledger(
   id BIGSERIAL PRIMARY KEY, customer_id BIGINT NOT NULL REFERENCES customers(id),
@@ -160,6 +172,49 @@ CREATE TABLE customer_ledger(
   CHECK ((kind = 'sale_debt' AND amount > 0 AND sale_id IS NOT NULL AND debt_payment_id IS NULL)
       OR (kind = 'payment' AND amount < 0 AND debt_payment_id IS NOT NULL AND sale_id IS NULL)
       OR (kind = 'return_credit' AND amount < 0 AND sale_id IS NOT NULL AND debt_payment_id IS NULL)));
+
+-- Yetkazuvchiga pul berish (avans/to'lov) yoki undan pul qaytarib olish (kassaga kirim)
+CREATE TABLE supplier_payments(
+  id BIGSERIAL PRIMARY KEY, supplier_id BIGINT NOT NULL REFERENCES suppliers(id),
+  kind TEXT NOT NULL CHECK(kind IN ('payment','refund')), amount BIGINT NOT NULL CHECK(amount > 0),
+  method TEXT NOT NULL DEFAULT 'cash' CHECK(method IN ('cash','card','transfer')), note TEXT DEFAULT '',
+  user_id BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+-- Kassa operatsiyalari: xarajat (foydadan ayriladi) va egasi pul kiritishi/olishi (foydaga ta'sir qilmaydi)
+CREATE TABLE cash_operations(
+  id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('expense','owner_deposit','owner_withdrawal')),
+  category TEXT, amount BIGINT NOT NULL CHECK(amount > 0),
+  method TEXT NOT NULL DEFAULT 'cash' CHECK(method IN ('cash','card','transfer')), note TEXT DEFAULT '',
+  user_id BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((kind = 'expense') = (category IS NOT NULL)));
+-- Yetkazuvchi daftari: musbat = biz qarzdormiz, manfiy = yetkazuvchida bizning avansimiz
+CREATE TABLE supplier_ledger(
+  id BIGSERIAL PRIMARY KEY, supplier_id BIGINT NOT NULL REFERENCES suppliers(id),
+  kind TEXT NOT NULL CHECK(kind IN ('receipt','receipt_reversal','payment','refund')), amount BIGINT NOT NULL,
+  receipt_id BIGINT REFERENCES receipts(id), supplier_payment_id BIGINT REFERENCES supplier_payments(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK ((kind = 'receipt' AND amount > 0 AND receipt_id IS NOT NULL AND supplier_payment_id IS NULL)
+      OR (kind = 'receipt_reversal' AND amount < 0 AND receipt_id IS NOT NULL AND supplier_payment_id IS NULL)
+      OR (kind = 'payment' AND amount < 0 AND supplier_payment_id IS NOT NULL AND receipt_id IS NULL)
+      OR (kind = 'refund' AND amount > 0 AND supplier_payment_id IS NOT NULL AND receipt_id IS NULL)));
+-- Kassa hisoblari va daftari: har bir pul harakati aynan bitta hujjatga bog'langan; qoldiq faqat daftar orqali
+CREATE TABLE cash_accounts(
+  method TEXT PRIMARY KEY CHECK(method IN ('cash','card','transfer')), balance BIGINT NOT NULL DEFAULT 0,
+  CONSTRAINT chk_cash_nonneg CHECK(balance >= 0));
+INSERT INTO cash_accounts(method) VALUES ('cash'), ('card'), ('transfer');
+CREATE TABLE cash_ledger(
+  id BIGSERIAL PRIMARY KEY, method TEXT NOT NULL REFERENCES cash_accounts(method),
+  kind TEXT NOT NULL CHECK(kind IN ('sale','return_refund','debt_payment','supplier_payment','supplier_refund','cash_purchase','purchase_reversal','expense','owner_deposit','owner_withdrawal')),
+  amount BIGINT NOT NULL,
+  sale_id BIGINT REFERENCES sales(id), debt_payment_id BIGINT REFERENCES debt_payments(id), supplier_payment_id BIGINT REFERENCES supplier_payments(id),
+  receipt_id BIGINT REFERENCES receipts(id), cash_operation_id BIGINT REFERENCES cash_operations(id),
+  user_id BIGINT NOT NULL REFERENCES users(id), created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CHECK (num_nonnulls(sale_id, debt_payment_id, supplier_payment_id, receipt_id, cash_operation_id) = 1),
+  CHECK ((kind = 'sale' AND amount > 0 AND sale_id IS NOT NULL) OR (kind = 'return_refund' AND amount < 0 AND sale_id IS NOT NULL)
+      OR (kind = 'debt_payment' AND amount > 0 AND debt_payment_id IS NOT NULL)
+      OR (kind = 'supplier_payment' AND amount < 0 AND supplier_payment_id IS NOT NULL) OR (kind = 'supplier_refund' AND amount > 0 AND supplier_payment_id IS NOT NULL)
+      OR (kind = 'cash_purchase' AND amount < 0 AND receipt_id IS NOT NULL) OR (kind = 'purchase_reversal' AND amount > 0 AND receipt_id IS NOT NULL)
+      OR (kind = 'expense' AND amount < 0 AND cash_operation_id IS NOT NULL) OR (kind = 'owner_deposit' AND amount > 0 AND cash_operation_id IS NOT NULL)
+      OR (kind = 'owner_withdrawal' AND amount < 0 AND cash_operation_id IS NOT NULL)));
 
 -- O'zgarishlar tarixi (SAP: CDHDR/CDPOS)
 CREATE TABLE change_log(
@@ -180,6 +235,14 @@ CREATE INDEX idx_moves_sale ON stock_moves(sale_id);
 CREATE INDEX idx_moves_receipt ON stock_moves(receipt_id);
 CREATE INDEX idx_ledger_cust ON customer_ledger(customer_id);
 CREATE INDEX idx_ledger_sale ON customer_ledger(sale_id);
+CREATE INDEX idx_moves_writeoff ON stock_moves(writeoff_id);
+CREATE INDEX idx_sup_ledger_sup ON supplier_ledger(supplier_id);
+CREATE INDEX idx_sup_ledger_receipt ON supplier_ledger(receipt_id);
+CREATE INDEX idx_cash_ledger_created ON cash_ledger(created_at);
+CREATE INDEX idx_cash_ledger_sale ON cash_ledger(sale_id);
+CREATE INDEX idx_cash_ledger_receipt ON cash_ledger(receipt_id);
+CREATE INDEX idx_cash_ledger_ops ON cash_ledger(cash_operation_id);
+CREATE INDEX idx_writeoffs_prod ON writeoffs(product_id);
 CREATE INDEX idx_change_log_rec ON change_log(table_name, record_id);
 `;
 
@@ -191,8 +254,10 @@ CREATE INDEX idx_change_log_rec ON change_log(table_name, record_id);
 //    oxirida tekshiriladi): yo'qdan bor ham, bordan yo'q ham bo'lmaydi.
 // 5) Asosiy ma'lumotlar o'zgarishi change_log ga yoziladi.
 const ALL_TABLES = ['users', 'sessions', 'login_attempts', 'products', 'suppliers', 'customers', 'purchase_orders', 'po_items', 'receipts',
-  'receipt_items', 'sales', 'sale_items', 'stock_moves', 'debt_payments', 'customer_ledger', 'change_log'];
-const DOCUMENTS = ['po_items', 'receipts', 'receipt_items', 'sales', 'sale_items', 'stock_moves', 'debt_payments', 'customer_ledger', 'change_log'];
+  'receipt_items', 'sales', 'sale_items', 'stock_moves', 'debt_payments', 'customer_ledger', 'writeoffs', 'supplier_payments', 'cash_operations',
+  'supplier_ledger', 'cash_accounts', 'cash_ledger', 'change_log'];
+const DOCUMENTS = ['po_items', 'receipts', 'receipt_items', 'sales', 'sale_items', 'stock_moves', 'debt_payments', 'customer_ledger', 'writeoffs',
+  'supplier_payments', 'cash_operations', 'supplier_ledger', 'cash_ledger', 'change_log'];
 const MASTER = ['users', 'products', 'suppliers', 'customers', 'purchase_orders'];
 const ERR = "USING ERRCODE = 'integrity_constraint_violation'";
 
@@ -226,6 +291,19 @@ CREATE FUNCTION guard_balance() RETURNS trigger AS $$
 BEGIN
   IF NEW.balance IS DISTINCT FROM OLD.balance AND COALESCE(current_setting('app.ledger', true), '') <> '1' THEN
     RAISE EXCEPTION 'Qarz to''g''ridan-to''g''ri o''zgartirilmaydi: mijoz daftari (customer_ledger) yozuvi kerak' ${ERR}; END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE FUNCTION guard_cash_account() RETURNS trigger AS $$
+BEGIN
+  IF NEW.balance IS DISTINCT FROM OLD.balance AND COALESCE(current_setting('app.ledger', true), '') <> '1' THEN
+    RAISE EXCEPTION 'Kassa qoldig''i to''g''ridan-to''g''ri o''zgartirilmaydi: kassa daftari (cash_ledger) yozuvi kerak' ${ERR}; END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+CREATE FUNCTION apply_cash_entry() RETURNS trigger AS $$
+BEGIN
+  PERFORM set_config('app.ledger', '1', true);
+  UPDATE cash_accounts SET balance = balance + NEW.amount WHERE method = NEW.method;
+  PERFORM set_config('app.ledger', '', true);
   RETURN NEW;
 END $$ LANGUAGE plpgsql;
 CREATE FUNCTION apply_stock_move() RETURNS trigger AS $$
@@ -263,7 +341,7 @@ END $$ LANGUAGE plpgsql;
 
 -- Hujjat-darajali tekshiruvlar (tranzaksiya oxirida, DEFERRED)
 CREATE FUNCTION check_sale_doc() RETURNS trigger AS $$
-DECLARE s sales%ROWTYPE; n int; sum_lines bigint; bad int; debt bigint; credit bigint;
+DECLARE s sales%ROWTYPE; n int; sum_lines bigint; bad int; debt bigint; credit bigint; cash_in bigint; cash_out bigint;
 BEGIN
   SELECT * INTO s FROM sales WHERE id = NEW.id;
   SELECT COUNT(*), COALESCE(SUM(line_total), 0) INTO n, sum_lines FROM sale_items WHERE sale_id = s.id;
@@ -277,15 +355,20 @@ BEGIN
     SELECT COALESCE(SUM(amount), 0) INTO debt FROM customer_ledger WHERE sale_id = s.id AND kind = 'sale_debt';
     IF debt <> s.total - s.paid THEN RAISE EXCEPTION 'Nasiya summasi mijoz daftariga mos emas (#%)', s.id ${ERR}; END IF;
     IF s.total > s.paid AND s.customer_id IS NULL THEN RAISE EXCEPTION 'Nasiya uchun mijoz kerak (#%)', s.id ${ERR}; END IF;
+    SELECT COALESCE(SUM(amount), 0) INTO cash_in FROM cash_ledger WHERE sale_id = s.id AND kind = 'sale' AND method = s.method;
+    IF cash_in <> s.paid OR EXISTS (SELECT 1 FROM cash_ledger WHERE sale_id = s.id AND (kind <> 'sale' OR method <> s.method)) THEN
+      RAISE EXCEPTION 'Sotuv to''lovi kassa daftariga mos emas (#%)', s.id ${ERR}; END IF;
   ELSE
     SELECT COALESCE(-SUM(amount), 0) INTO credit FROM customer_ledger WHERE sale_id = s.id AND kind = 'return_credit';
-    IF credit > -s.total THEN RAISE EXCEPTION 'Qarzga qaytarilgan summa qaytarish summasidan oshib ketdi (#%)', s.id ${ERR}; END IF;
+    SELECT COALESCE(-SUM(amount), 0) INTO cash_out FROM cash_ledger WHERE sale_id = s.id AND kind = 'return_refund' AND method = s.method;
+    IF credit + cash_out <> -s.total OR EXISTS (SELECT 1 FROM cash_ledger WHERE sale_id = s.id AND (kind <> 'return_refund' OR method <> s.method)) THEN
+      RAISE EXCEPTION 'Qaytarish summasi qarz va kassa daftariga mos emas (#%)', s.id ${ERR}; END IF;
   END IF;
   RETURN NULL;
 END $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION check_receipt_doc() RETURNS trigger AS $$
-DECLARE r receipts%ROWTYPE; n int; sum_lines bigint; bad int; orig receipts%ROWTYPE; po purchase_orders%ROWTYPE;
+DECLARE r receipts%ROWTYPE; n int; sum_lines bigint; bad int; orig receipts%ROWTYPE; po purchase_orders%ROWTYPE; sl bigint; cl bigint;
 BEGIN
   SELECT * INTO r FROM receipts WHERE id = NEW.id;
   SELECT COUNT(*), COALESCE(SUM(line_total), 0) INTO n, sum_lines FROM receipt_items WHERE receipt_id = r.id;
@@ -308,6 +391,19 @@ BEGIN
       FULL JOIN (SELECT product_id, SUM(-qty) q FROM receipt_items WHERE receipt_id = r.ref_receipt_id GROUP BY product_id) o USING (product_id)
       WHERE abs(COALESCE(i.q, 0) - COALESCE(o.q, 0)) > 1e-6;
     IF bad > 0 THEN RAISE EXCEPTION 'Storno qatorlari asl kirimga mos emas (#%)', r.id ${ERR}; END IF;
+  END IF;
+  -- Pul tomoni: yetkazuvchili kirim yetkazuvchi hisobiga (qarz/avansdan ayriladi), yetkazuvchisiz — kassadan to'lanadi
+  SELECT COALESCE(SUM(amount), 0) INTO sl FROM supplier_ledger WHERE receipt_id = r.id AND supplier_id IS NOT DISTINCT FROM r.supplier_id;
+  SELECT COALESCE(SUM(amount), 0) INTO cl FROM cash_ledger WHERE receipt_id = r.id AND method = r.pay_method;
+  IF r.kind = 'opening' THEN
+    IF EXISTS (SELECT 1 FROM supplier_ledger WHERE receipt_id = r.id) OR EXISTS (SELECT 1 FROM cash_ledger WHERE receipt_id = r.id) THEN
+      RAISE EXCEPTION 'Boshlang''ich qoldiq pul harakati yaratmaydi (#%)', r.id ${ERR}; END IF;
+  ELSIF r.supplier_id IS NOT NULL THEN
+    IF sl <> r.total OR EXISTS (SELECT 1 FROM cash_ledger WHERE receipt_id = r.id) THEN
+      RAISE EXCEPTION 'Kirim yetkazuvchi daftariga mos emas (#%)', r.id ${ERR}; END IF;
+  ELSE
+    IF cl <> -r.total OR EXISTS (SELECT 1 FROM supplier_ledger WHERE receipt_id = r.id) OR EXISTS (SELECT 1 FROM cash_ledger WHERE receipt_id = r.id AND method <> r.pay_method) THEN
+      RAISE EXCEPTION 'Naqd xarid kassa daftariga mos emas (#%)', r.id ${ERR}; END IF;
   END IF;
   IF r.po_id IS NOT NULL THEN  -- buyurtma bo'yicha kirim buyurtma qatorlariga teng
     SELECT * INTO po FROM purchase_orders WHERE id = r.po_id;
@@ -333,6 +429,35 @@ CREATE FUNCTION check_debt_payment() RETURNS trigger AS $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM customer_ledger WHERE debt_payment_id = NEW.id AND customer_id = NEW.customer_id AND amount = -NEW.amount AND kind = 'payment') THEN
     RAISE EXCEPTION 'To''lov mijoz daftariga yozilmagan (#%)', NEW.id ${ERR}; END IF;
+  IF NOT EXISTS (SELECT 1 FROM cash_ledger WHERE debt_payment_id = NEW.id AND amount = NEW.amount AND method = NEW.method AND kind = 'debt_payment') THEN
+    RAISE EXCEPTION 'Mijoz to''lovi kassa daftariga yozilmagan (#%)', NEW.id ${ERR}; END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION check_supplier_payment() RETURNS trigger AS $$
+DECLARE sign int := CASE WHEN NEW.kind = 'payment' THEN -1 ELSE 1 END;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM supplier_ledger WHERE supplier_payment_id = NEW.id AND supplier_id = NEW.supplier_id AND kind = NEW.kind AND amount = sign * NEW.amount) THEN
+    RAISE EXCEPTION 'Yetkazuvchi to''lovi yetkazuvchi daftariga yozilmagan (#%)', NEW.id ${ERR}; END IF;
+  IF NOT EXISTS (SELECT 1 FROM cash_ledger WHERE supplier_payment_id = NEW.id AND method = NEW.method AND amount = sign * NEW.amount
+                 AND kind = CASE WHEN NEW.kind = 'payment' THEN 'supplier_payment' ELSE 'supplier_refund' END) THEN
+    RAISE EXCEPTION 'Yetkazuvchi to''lovi kassa daftariga yozilmagan (#%)', NEW.id ${ERR}; END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION check_cash_operation() RETURNS trigger AS $$
+DECLARE sign int := CASE WHEN NEW.kind = 'owner_deposit' THEN 1 ELSE -1 END;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM cash_ledger WHERE cash_operation_id = NEW.id AND kind = NEW.kind AND method = NEW.method AND amount = sign * NEW.amount) THEN
+    RAISE EXCEPTION 'Kassa operatsiyasi kassa daftariga yozilmagan (#%)', NEW.id ${ERR}; END IF;
+  RETURN NULL;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION check_writeoff() RETURNS trigger AS $$
+BEGIN
+  IF (SELECT COUNT(*) FROM stock_moves WHERE writeoff_id = NEW.id) <> 1 OR
+     NOT EXISTS (SELECT 1 FROM stock_moves WHERE writeoff_id = NEW.id AND product_id = NEW.product_id AND type = 'writeoff' AND abs(qty + NEW.qty) < 0.000001) THEN
+    RAISE EXCEPTION 'Hisobdan chiqarish ombor harakatiga mos emas (#%)', NEW.id ${ERR}; END IF;
   RETURN NULL;
 END $$ LANGUAGE plpgsql;
 
@@ -362,6 +487,11 @@ ${DOCUMENTS.map((t) => `CREATE TRIGGER trg_immutable BEFORE UPDATE ON ${t} FOR E
 CREATE TRIGGER trg_po_guard BEFORE UPDATE ON purchase_orders FOR EACH ROW EXECUTE FUNCTION guard_purchase_order();
 CREATE TRIGGER trg_guard_stock BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION guard_stock();
 CREATE TRIGGER trg_guard_balance BEFORE UPDATE ON customers FOR EACH ROW EXECUTE FUNCTION guard_balance();
+CREATE TRIGGER trg_guard_cash BEFORE UPDATE ON cash_accounts FOR EACH ROW EXECUTE FUNCTION guard_cash_account();
+CREATE TRIGGER trg_apply_cash AFTER INSERT ON cash_ledger FOR EACH ROW EXECUTE FUNCTION apply_cash_entry();
+CREATE CONSTRAINT TRIGGER trg_supplier_payment_doc AFTER INSERT ON supplier_payments DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_supplier_payment();
+CREATE CONSTRAINT TRIGGER trg_cash_op_doc AFTER INSERT ON cash_operations DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_cash_operation();
+CREATE CONSTRAINT TRIGGER trg_writeoff_doc AFTER INSERT ON writeoffs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION check_writeoff();
 CREATE TRIGGER trg_apply_move AFTER INSERT ON stock_moves FOR EACH ROW EXECUTE FUNCTION apply_stock_move();
 CREATE TRIGGER trg_apply_ledger AFTER INSERT ON customer_ledger FOR EACH ROW EXECUTE FUNCTION apply_ledger_entry();
 CREATE TRIGGER trg_validate_item BEFORE INSERT ON sale_items FOR EACH ROW EXECUTE FUNCTION validate_sale_item();
@@ -374,7 +504,7 @@ ${MASTER.map((t) => `CREATE TRIGGER trg_audit AFTER INSERT OR UPDATE ON ${t} FOR
 
 // Sxema versiyasi: SCHEMA/INTEGRITY o'zgarganda oshiring. Bir vaqtda bir nechta serverless nusxa ishga tushsa ham
 // migratsiya advisory lock ostida faqat bir marta bajariladi (tranzaksion DDL).
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 export async function migrate(db) {
   await db.tx(async (t) => {
     await t.q('SELECT pg_advisory_xact_lock(727001)');

@@ -4,8 +4,9 @@ const $ = (s, el = document) => el.querySelector(s);
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
-    // 'change' blur paytida, element olib tashlanayotganda ham ishga tushadi — qayta chizish xatosi bo'lmasin deb keyinga suriladi
-    if (k === 'onchange') el.addEventListener('change', (e) => setTimeout(() => v(e), 0));
+    // 'change' sinxron ishlaydi (tugma bosilganda oxirgi kiritilgan qiymat darrov hisobga olinsin). Element qayta chizish
+    // paytida olib tashlanayotgan bo'lsa (blur), uning o'zgarishi allaqachon keraksiz — o'tkazib yuboramiz (ichma-ich chizish xatosi bo'lmasin)
+    if (k === 'onchange') el.addEventListener('change', (e) => { if (e.target.isConnected) v(e); });
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else if (k === 'class') el.className = v;
     else if (v === true) el.setAttribute(k, '');
@@ -63,6 +64,13 @@ function flash(box, text, kind = 'err') { box.replaceChildren(text ? h('div', { 
 const table = (head, rows, numCols = []) => h('div', { class: 'wrap' }, h('table', {},
   h('thead', {}, h('tr', {}, head.map((t, i) => h('th', { class: numCols.includes(i) ? 'n' : '' }, t)))),
   h('tbody', {}, rows.map((r) => h('tr', {}, r.map((c, i) => h('td', { class: numCols.includes(i) ? 'n' : '' }, c)))))));
+const METHOD = { cash: 'Naqd', card: 'Karta', transfer: "O'tkazma" };
+const methodSelect = (v = 'cash') => h('select', {}, Object.entries(METHOD).map(([k, l]) => h('option', { value: k, selected: k === v }, l)));
+const CASH_KIND = { sale: 'Sotuvdan tushum', return_refund: 'Qaytarish (pul qaytarildi)', debt_payment: "Mijoz qarz to'lovi", supplier_payment: "Yetkazuvchiga to'lov / avans",
+  supplier_refund: 'Yetkazuvchi pul qaytardi', cash_purchase: 'Naqd xarid (kirim)', purchase_reversal: 'Naqd xarid storno', expense: 'Xarajat', owner_deposit: 'Egasi pul kiritdi', owner_withdrawal: 'Egasi pul oldi' };
+const CATS = { rent: 'Ijara', salary: 'Ish haqi', utilities: 'Kommunal', transport: 'Transport', tax: 'Soliq', marketing: 'Reklama', other: 'Boshqa' };
+const REASONS = { damaged: 'Brak', expired: "Muddati o'tgan", lost: "Yo'qolgan", other: 'Boshqa' };
+const signed = (n) => (n > 0 ? '+' : n < 0 ? '−' : '') + fmt(Math.abs(n));
 const activeTag = (a) => h('span', { class: 'tag ' + (a ? 'ok' : 'cancelled') }, a ? 'Aktiv' : 'Noaktiv');
 const STATUS_OPTS = () => [h('option', { value: 'active' }, 'Aktiv'), h('option', { value: 'inactive' }, 'Noaktiv'), h('option', { value: 'all' }, 'Hammasi')];
 const stockTag = (p) => p.stock <= 0 ? h('span', { class: 'tag out' }, 'Tugagan') : p.stock <= p.min_stock ? h('span', { class: 'tag low' }, 'Kam') : h('span', { class: 'tag ok' }, 'Yetarli');
@@ -195,7 +203,16 @@ async function receiptView() {
   const [products, suppliers] = await Promise.all([get('/api/products'), get('/api/suppliers')]);
   const isAdmin = state.user.role === 'admin';
   const lines = []; const box = msgBox(), area = h('div'), hist = h('div');
-  const sup = h('select', {}, h('option', { value: '' }, '— Yetkazib beruvchi —'), suppliers.map((s) => h('option', { value: s.id }, s.name)));
+  const supInfo = h('div', { class: 'mute', style: 'margin:0 0 8px' });
+  const payMethod = methodSelect();
+  const balText = (b) => (b < 0 ? `yetkazuvchida avansimiz: ${money(-b)}` : b > 0 ? `biz qarzdormiz: ${money(b)}` : 'hisob-kitob teng');
+  const drawSupInfo = () => {
+    const sp = suppliers.find((x) => String(x.id) === sup.value);
+    payMethod.style.display = sp ? 'none' : '';
+    supInfo.replaceChildren(sp ? `Bu kirim yetkazuvchi hisobiga yoziladi (avansdan ayriladi). Hozir: ${balText(sp.balance)}.`
+      : "Yetkazuvchi tanlanmagan — naqd xarid: summa kassadan to'lanadi.");
+  };
+  const sup = h('select', { onchange: drawSupInfo }, h('option', { value: '' }, '— Yetkazib beruvchi —'), suppliers.map((s) => h('option', { value: s.id }, s.name)));
   const newSup = h('input', { placeholder: 'Yangi yetkazib beruvchi' });
   const prod = h('select', {}, products.map((p) => h('option', { value: p.id }, p.name)));
   const note = h('input', { placeholder: 'Izoh (ixtiyoriy)', style: 'flex:1' });
@@ -240,19 +257,21 @@ async function receiptView() {
         try { await post(`/api/admin/receipts/${r.id}/reverse`); flash(box, 'Storno hujjati yaratildi', 'ok'); loadHist(); } catch (e) { flash(box, e.message); }
       } }, 'Storno') : (r.kind === 'receipt' ? h('span', { class: 'mute' }, 'storno qilingan') : null))] : [])), [4]) : h('p', { class: 'mute' }, 'Bugun kirim yo\'q'));
   };
+  setTimeout(drawSupInfo, 0);
   const addSup = async () => {
     if (!newSup.value.trim()) return;
-    try { const r = await post('/api/suppliers', { name: newSup.value }); const o = h('option', { value: r.id }, newSup.value); sup.append(o); sup.value = r.id; newSup.value = ''; } catch (e) { flash(box, e.message); }
+    try { const r = await post('/api/suppliers', { name: newSup.value }); suppliers.push({ id: r.id, name: newSup.value, balance: 0 }); const o = h('option', { value: r.id }, newSup.value); sup.append(o); sup.value = r.id; newSup.value = ''; drawSupInfo(); } catch (e) { flash(box, e.message); }
   };
   const save = async () => {
     try {
-      const r = await post('/api/receipts', { supplier_id: sup.value || null, note: note.value, items: lines.map((l) => ({ product_id: l.id, qty: l.qty, cost: l.cost })) });
+      const r = await post('/api/receipts', { supplier_id: sup.value || null, pay_method: payMethod.value, note: note.value, items: lines.map((l) => ({ product_id: l.id, qty: l.qty, cost: l.cost })) });
       flash(box, `Kirim #${r.id} saqlandi: ${money(r.total)}`, 'ok'); lines.length = 0; draw(); loadHist();
+      suppliers.splice(0, suppliers.length, ...(await get('/api/suppliers'))); drawSupInfo();
     } catch (e) { flash(box, e.message); }
   };
   draw(); loadHist();
   return h('div', {}, h('div', { class: 'card' }, h('h3', {}, 'Yangi kirim'), box,
-    h('div', { class: 'row' }, sup, newSup, h('button', { class: 'btn sec', onclick: addSup }, "Qo'shish")),
+    h('div', { class: 'row' }, sup, payMethod, newSup, h('button', { class: 'btn sec', onclick: addSup }, "Qo'shish")), supInfo,
     h('div', { class: 'row' }, prod, h('button', { class: 'btn sec', onclick: add }, "+ Mahsulot"), h('button', { class: 'btn', onclick: startScan }, '📷 Skaner')), area,
     h('div', { class: 'row', style: 'margin-top:10px' }, note, h('button', { class: 'btn', onclick: save }, 'Kirim qilish'))),
     h('div', { class: 'card' }, h('h3', {}, 'Bugungi kirimlar'), hist));
@@ -273,13 +292,23 @@ async function stockView() {
     const rows = products.filter((p) => (!s || p.name.toLowerCase().includes(s) || (p.category || '').toLowerCase().includes(s) || (p.sku || '').toLowerCase().includes(s)) && (!only.value || p.stock <= p.min_stock));
     const head = ['Mahsulot', 'Kategoriya', 'Qoldiq', 'Min.', 'Narx', 'Holat'].concat(isAdmin ? ['Tannarx', 'Status', ''] : []);
     out.replaceChildren(table(head, rows.map((p) => [p.name, p.category, `${qf(p.stock)} ${p.unit}`, qf(p.min_stock), fmt(p.price), stockTag(p)]
-      .concat(isAdmin ? [fmt(p.cost), activeTag(p.active), h('span', { class: 'row', style: 'margin:0' }, h('button', { class: 'btn sec', onclick: () => edit(p) }, 'Tahrir'), h('button', { class: 'btn sec', onclick: () => setStatus(p) }, p.active ? 'Noaktiv qilish' : 'Faollashtirish'))] : [])), [2, 3, 4, 6]));
+      .concat(isAdmin ? [fmt(p.cost), activeTag(p.active), h('span', { class: 'row', style: 'margin:0' }, h('button', { class: 'btn sec', onclick: () => edit(p) }, 'Tahrir'), h('button', { class: 'btn sec', onclick: () => setStatus(p) }, p.active ? 'Noaktiv qilish' : 'Faollashtirish'), p.active && p.stock > 0 ? h('button', { class: 'btn sec', onclick: () => writeoff(p) }, 'Hisobdan chiqarish') : null)] : [])), [2, 3, 4, 6]));
   };
   const setStatus = async (p) => {
     if (p.active && !confirm(`"${p.name}" noaktiv qilinsinmi? Ma'lumot o'chirilmaydi, lekin yangi sotuv/kirimda ishlatib bo'lmaydi.`)) return;
     try { await post(`/api/products/${p.id}/status`, { active: !p.active }); flash(box, p.active ? 'Noaktiv qilindi' : 'Faollashtirildi', 'ok'); reload(); } catch (e) { flash(box, e.message); }
   };
   const form = h('div');
+  const writeoff = (p) => {
+    const qty = h('input', { type: 'number', min: 0, step: 'any', max: p.stock, placeholder: 'Miqdor', style: 'width:120px' });
+    const reason = h('select', {}, Object.entries(REASONS).map(([k, l]) => h('option', { value: k }, l))); const note = h('input', { placeholder: 'Izoh', style: 'flex:1;min-width:140px' });
+    form.replaceChildren(h('div', { class: 'card' }, h('h3', {}, `Hisobdan chiqarish: ${p.name}`), h('p', { class: 'mute' }, `Qoldiq ${qf(p.stock)} ${p.unit}. Tannarx bo'yicha zarar sifatida foydadan ayriladi; ombor harakati hujjat bilan yoziladi.`),
+      h('div', { class: 'row' }, qty, reason, note, h('button', { class: 'btn bad', onclick: async () => {
+        try { const r = await post('/api/admin/writeoffs', { product_id: p.id, qty: Number(qty.value), reason: reason.value, note: note.value });
+          form.replaceChildren(); await reload(); flash(box, `Hisobdan chiqarildi: zarar ${money(r.total)}`, 'ok'); } catch (e) { flash(box, e.message); }
+      } }, 'Chiqarish'), h('button', { class: 'btn sec', onclick: () => form.replaceChildren() }, 'Bekor'))));
+    form.scrollIntoView({ behavior: 'smooth' });
+  };
   const edit = (p) => {
     const f = { name: p?.name || '', sku: p?.sku || '', category: p?.category || '', unit: p?.unit || 'dona', price: p?.price || 0, cost: p?.cost || 0, min_stock: p?.min_stock || 0, stock: 0 };
     const field = (k, label, type = 'text') => h('label', { class: 'mute' }, label, h('br'), h('input', { type, step: 'any', value: f[k], oninput: (e) => { f[k] = type === 'number' ? Number(e.target.value) : e.target.value; } }));
@@ -320,9 +349,11 @@ async function dashboardView() {
     const t = sum.today, y = sum.yesterday, inv = sum.inventory;
     const peak = hourly.hours.reduce((a, b) => (b.revenue > a.revenue ? b : a));
     wrap.replaceChildren(
-      h('div', { class: 'grid' }, kpi('Tushum', money(t.revenue), delta(t.revenue, y.revenue)), kpi('Foyda', money(t.profit), delta(t.profit, y.profit)),
+      h('div', { class: 'grid' }, kpi('Tushum', money(t.revenue), delta(t.revenue, y.revenue)), kpi('Yalpi foyda', money(t.profit), delta(t.profit, y.profit)),
+        kpi('Sof foyda', money(t.net_profit), t.expenses || t.writeoffs ? `xarajat ${fmt(t.expenses)} · hisobdan chiqarish ${fmt(t.writeoffs)}` : 'xarajatsiz'), kpi('Kassa', money(sum.cash.total), sum.cash.accounts.map((a) => `${METHOD[a.method]} ${fmt(a.balance)}`).join(' · ')),
         kpi('Cheklar', fmt(t.orders), delta(t.orders, y.orders)), kpi('Ombor qiymati (tannarx)', money(inv.cost_value), `${inv.products} ta mahsulot, ${inv.low || 0} tasi kam`),
-        kpi('Nasiya (qarzlar)', money(sum.debt.total), `${sum.debt.customers} ta mijoz`)),
+        kpi('Nasiya (qarzlar)', money(sum.debt.total), `${sum.debt.customers} ta mijoz`),
+        kpi('Yetkazuvchilar', sum.suppliers.advances ? `avans ${fmt(sum.suppliers.advances)}` : '—', sum.suppliers.payables ? `qarzimiz ${money(sum.suppliers.payables)}` : "qarzimiz yo'q")),
       h('div', { class: 'card' }, h('h3', {}, `Soatma-soat tushum — ${date}${pid ? ' (tanlangan mahsulot)' : ''}`), barChart(hourly.hours, { label: (x) => String(x.hour).padStart(2, '0'), value: (x) => x.revenue }),
         h('p', { class: 'mute' }, peak.revenue ? `Eng gavjum soat: ${String(peak.hour).padStart(2, '0')}:00 (${money(peak.revenue)})` : 'Bu kunda sotuv yo\'q')),
       h('div', { class: 'card' }, h('h3', {}, `Kunma-kun tushum — oxirgi ${days} kun`), barChart(daily.days, { label: (x) => x.day.slice(5), value: (x) => x.revenue })),
@@ -445,13 +476,14 @@ async function returnsView() {
 async function customersView() {
   const isAdmin = state.user.role === 'admin';
   const box = msgBox(), out = h('div'); const f = { name: '', phone: '' }; let status = 'active';
+  const payM = methodSelect();
   const load = async () => {
     const cs = await get('/api/customers' + (isAdmin ? '?status=' + status : ''));
     out.replaceChildren(cs.length ? table(['Mijoz', 'Telefon', 'Qarz'].concat(isAdmin ? ['Status'] : []).concat(['']), cs.map((c) => [c.name, c.phone, c.balance ? h('b', {}, money(c.balance)) : '—']
       .concat(isAdmin ? [activeTag(c.active)] : [])
       .concat([h('span', { class: 'row', style: 'margin:0' }, c.balance ? h('button', { class: 'btn sec', onclick: async () => {
-        const v = prompt(`${c.name}: to'lov summasi (qarz ${fmt(c.balance)})`, c.balance); if (!v) return;
-        try { await post(`/api/customers/${c.id}/payments`, { amount: Number(v) }); flash(box, "To'lov qabul qilindi", 'ok'); load(); } catch (e) { flash(box, e.message); }
+        const v = prompt(`${c.name}: to'lov summasi (qarz ${fmt(c.balance)}). Usul: ${METHOD[payM.value]}`, c.balance); if (!v) return;
+        try { await post(`/api/customers/${c.id}/payments`, { amount: Number(v), method: payM.value }); flash(box, "To'lov qabul qilindi", 'ok'); load(); } catch (e) { flash(box, e.message); }
       } }, "To'lov qabul qilish") : null,
       isAdmin ? h('button', { class: 'btn sec', onclick: async () => {
         if (c.active && !confirm(`"${c.name}" noaktiv qilinsinmi? Ma'lumot o'chirilmaydi.`)) return;
@@ -462,7 +494,7 @@ async function customersView() {
   await load();
   return h('div', {}, box, h('div', { class: 'card' }, h('h3', {}, 'Yangi mijoz'), h('div', { class: 'row' }, inp('name', 'Ism'), inp('phone', 'Telefon'),
     h('button', { class: 'btn', onclick: async () => { try { await post('/api/customers', f); flash(box, "Qo'shildi", 'ok'); load(); } catch (e) { flash(box, e.message); } } }, "Qo'shish"))),
-    h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Nasiya (qarzdorlar)'), isAdmin ? h('select', { onchange: (e) => { status = e.target.value; load(); } }, STATUS_OPTS()) : null), out));
+    h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Nasiya (qarzdorlar)'), h('span', { class: 'mute' }, "To'lov usuli:"), payM, isAdmin ? h('select', { onchange: (e) => { status = e.target.value; load(); } }, STATUS_OPTS()) : null), out));
 }
 
 // ---------- Admin: yetkazib beruvchilar ----------
@@ -501,10 +533,117 @@ async function auditView() {
     h('p', { class: 'mute' }, "Ma'lumotlar hech qachon o'chirilmaydi: faqat noaktiv qilinadi. Hujjatlar (sotuv, kirim) o'zgarmaydi — qaytarish/storno bilan tuzatiladi."), out);
 }
 
+// ---------- Yetkazuvchi hisobi: avans, qarz, pul qaytarish ----------
+async function supplierAccountView() {
+  const isAdmin = state.user.role === 'admin';
+  const suppliers = await get('/api/suppliers');
+  const box = msgBox(), out = h('div');
+  const sel = h('select', { onchange: () => load() }, suppliers.map((x) => h('option', { value: x.id }, x.name)));
+  if (state.supplierId) sel.value = state.supplierId;
+  const amount = h('input', { type: 'number', min: 1, placeholder: 'Summa', style: 'width:150px' });
+  const method = methodSelect(); const note = h('input', { placeholder: 'Izoh (ixtiyoriy)', style: 'flex:1;min-width:140px' });
+  const KIND = { receipt: 'Tovar qabul qilindi (kirim)', receipt_reversal: 'Kirim storno', payment: "Pul berildi (avans / to'lov)", refund: 'Pul qaytarib olindi' };
+  const pay = async (kind) => {
+    const a = Number(amount.value);
+    if (!(a > 0)) return flash(box, 'Summani kiriting');
+    const sp = suppliers.find((x) => String(x.id) === sel.value);
+    if (!confirm(`${sp.name}: ${kind === 'payment' ? 'pul beriladi (kassadan chiqadi)' : 'pul qaytarib olinadi (kassaga kiradi)'} — ${money(a)}, ${METHOD[method.value]}. Tasdiqlaysizmi?`)) return;
+    try {
+      await post('/api/supplier-payments', { supplier_id: Number(sel.value), kind, amount: a, method: method.value, note: note.value });
+      amount.value = ''; note.value = ''; flash(box, kind === 'payment' ? 'Pul berildi, kassadan chiqdi' : 'Pul qaytarib olindi, kassaga kirdi', 'ok');
+      suppliers.splice(0, suppliers.length, ...(await get('/api/suppliers'))); load();
+    } catch (e) { flash(box, e.message); }
+  };
+  async function load() {
+    if (!sel.value) return out.replaceChildren(h('p', { class: 'mute' }, 'Yetkazuvchi yo\'q — avval Kirim bo\'limida qo\'shing'));
+    const a = await get(`/api/suppliers/${sel.value}/account`);
+    const tone = a.advance ? 'ok' : a.payable ? 'low' : 'cancelled';
+    out.replaceChildren(
+      h('div', { class: 'card' }, h('div', { class: 'row', style: 'justify-content:space-between' }, h('div', {},
+        h('div', { class: 'mute' }, a.advance ? 'Yetkazuvchida bizning avansimiz (pulimiz)' : a.payable ? 'Biz yetkazuvchidan qarzdormiz' : 'Hisob-kitob teng'),
+        h('div', { class: 'total' }, money(a.advance || a.payable))), h('span', { class: 'tag ' + tone }, a.advance ? 'Avans' : a.payable ? 'Qarz' : 'Teng')),
+        h('p', { class: 'mute' }, "Avans bor bo'lsa, shu yetkazuvchidan qabul qilingan tovar summasi avansdan avtomatik ayriladi. Avansning ishlatilmagan qismini qaytarib olish mumkin — pul kassaga kiradi.")),
+      h('div', { class: 'card' }, h('div', { class: 'row' }, amount, method, note),
+        h('div', { class: 'row' }, h('button', { class: 'btn', onclick: () => pay('payment') }, '💸 Pul berish (avans / qarz to\'lovi)'),
+          h('button', { class: 'btn sec', disabled: !a.advance, onclick: () => pay('refund') }, '↩ Pul qaytarib olish (kassaga)'))),
+      h('div', { class: 'card' }, h('h3', {}, 'Hisob-kitob tarixi'), a.entries.length ? table(['Vaqt', 'Amal', 'Summa', 'Qoldiq', 'Izoh'].concat(isAdmin ? [''] : []),
+        a.entries.map((e) => [hhmm(e.created_at), KIND[e.kind] + (e.method ? ` · ${METHOD[e.method]}` : ''), signed(e.amount),
+          e.balance_after < 0 ? `avans ${fmt(-e.balance_after)}` : e.balance_after > 0 ? `qarz ${fmt(e.balance_after)}` : 'teng', e.note || (e.receipt_id ? `Kirim #${e.receipt_id}` : '')]
+          .concat(isAdmin ? [flowBtn(e.receipt_id ? 'receipt' : 'supplier_payment', e.receipt_id || e.supplier_payment_id)] : [])), [2]) : h('p', { class: 'mute' }, 'Hali operatsiya yo\'q')));
+  }
+  await load();
+  return h('div', {}, box, h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Yetkazib beruvchi:'), sel)), out);
+}
+
+// ---------- Kassa ----------
+async function cashView() {
+  const isAdmin = state.user.role === 'admin';
+  let date = today(); const out = h('div'), box = msgBox();
+  const load = async () => {
+    const c = await get('/api/cash?date=' + date);
+    out.replaceChildren(
+      h('div', { class: 'grid' }, ...c.accounts.map((a) => h('div', { class: 'card kpi' }, h('div', { class: 'l' }, METHOD[a.method]), h('div', { class: 'v' }, money(a.balance)))),
+        h('div', { class: 'card kpi' }, h('div', { class: 'l' }, 'Jami kassa'), h('div', { class: 'v' }, money(c.total)))),
+      h('div', { class: 'card' }, h('div', { class: 'row', style: 'justify-content:space-between' }, h('b', {}, `Kun harakati — ${date}`),
+        h('span', {}, h('span', { class: 'up' }, `▲ kirim ${money(c.inflow)}`), '   ', h('span', { class: 'down' }, `▼ chiqim ${money(c.outflow)}`))),
+        c.entries.length ? table(['Vaqt', 'Hisob', 'Amal', 'Summa', 'Kim / izoh'].concat(isAdmin ? [''] : []), c.entries.map((e) => [hhmm(e.created_at), METHOD[e.method],
+          CASH_KIND[e.kind] + (e.kind === 'expense' && e.note ? `: ${CATS[e.note] || e.note}` : ''), h('span', { class: e.amount > 0 ? 'up' : 'down' }, signed(e.amount)),
+          [e.user, e.supplier ? ' · ' + e.supplier : '', e.note && e.kind !== 'expense' ? ' · ' + e.note : ''].join('')].concat(isAdmin ? [flowBtn(e.ref_type, e.ref_id)] : [])), [3]) : h('p', { class: 'mute' }, 'Bu kunda pul harakati yo\'q')));
+  };
+  const opForm = () => {
+    const kind = h('select', { onchange: () => { catSel.style.display = kind.value === 'expense' ? '' : 'none'; } }, h('option', { value: 'expense' }, 'Xarajat (foydadan ayriladi)'),
+      h('option', { value: 'owner_deposit' }, 'Egasi kassaga pul kiritdi'), h('option', { value: 'owner_withdrawal' }, 'Egasi kassadan pul oldi'));
+    const catSel = h('select', {}, Object.entries(CATS).map(([k, l]) => h('option', { value: k }, l)));
+    const amt = h('input', { type: 'number', min: 1, placeholder: 'Summa', style: 'width:150px' }); const m = methodSelect(); const nt = h('input', { placeholder: 'Izoh', style: 'flex:1;min-width:140px' });
+    return h('div', { class: 'card' }, h('h3', {}, 'Kassa operatsiyasi'), h('div', { class: 'row' }, kind, catSel, amt, m, nt,
+      h('button', { class: 'btn', onclick: async () => {
+        try { await post('/api/admin/cash-operations', { kind: kind.value, category: kind.value === 'expense' ? catSel.value : null, amount: Number(amt.value), method: m.value, note: nt.value });
+          amt.value = ''; nt.value = ''; flash(box, 'Saqlandi', 'ok'); load(); } catch (e) { flash(box, e.message); }
+      } }, 'Saqlash')));
+  };
+  await load();
+  return h('div', {}, box, isAdmin ? opForm() : null, h('div', { class: 'row' }, h('span', { class: 'mute' }, 'Sana:'), h('input', { type: 'date', value: date, max: today(), onchange: (e) => { date = e.target.value || today(); load(); } })), out);
+}
+
+// ---------- Admin: moliya (foyda-zarar, pul oqimi, holat) ----------
+async function financeView() {
+  let to = today(), days = 30; const out = h('div');
+  const row = (label, value, opt = {}) => h('tr', { class: opt.bold ? 'fin-b' : '' }, h('td', { style: opt.indent ? 'padding-left:24px' : '' }, label), h('td', { class: 'n' }, value), h('td', { class: 'n mute' }, opt.note || ''));
+  const load = async () => {
+    const f = await get(`/api/admin/finance?from=${addDays(to, -days + 1)}&to=${to}`);
+    const p = f.pl, c = f.cashflow, pos = f.position;
+    const tbl = (rows) => h('div', { class: 'wrap' }, h('table', {}, h('tbody', {}, rows)));
+    out.replaceChildren(
+      h('div', { class: 'grid' }, h('div', { class: 'card kpi' }, h('div', { class: 'l' }, 'Tushum (sof)'), h('div', { class: 'v' }, money(p.revenue)), h('div', { class: 'd mute' }, `chegirma: ${fmt(p.discounts)}`)),
+        h('div', { class: 'card kpi' }, h('div', { class: 'l' }, 'Yalpi foyda'), h('div', { class: 'v' }, money(p.gross_profit)), h('div', { class: 'd mute' }, `marja ${p.margin}%`)),
+        h('div', { class: 'card kpi' }, h('div', { class: 'l' }, 'Sof foyda'), h('div', { class: 'v ' + (p.net_profit >= 0 ? 'up' : 'down') }, money(p.net_profit)), h('div', { class: 'd mute' }, `marja ${p.net_margin}%`)),
+        h('div', { class: 'card kpi' }, h('div', { class: 'l' }, 'Kassa (hozir)'), h('div', { class: 'v' }, money(pos.cash)), h('div', { class: 'd mute' }, pos.accounts.map((a) => `${METHOD[a.method]} ${fmt(a.balance)}`).join(' · ')))),
+      h('div', { class: 'card' }, h('h3', {}, `Foyda va zarar — ${f.from} … ${f.to}`), tbl([
+        row('Sotuv (yalpi)', fmt(p.gross_sales)), row('− Qaytarishlar', fmt(p.returns), { indent: true }),
+        row('= Sof tushum (daromad)', fmt(p.revenue), { bold: true, note: p.discounts ? `chegirmalar ${fmt(p.discounts)} ichida` : '' }),
+        row("− Sotilgan tovar tannarxi (o'rtacha tannarx)", fmt(p.cogs), { indent: true }),
+        row('= Yalpi foyda', fmt(p.gross_profit), { bold: true, note: `${p.margin}%` }),
+        row('− Hisobdan chiqarish (brak, muddati o\'tgan...)', fmt(p.writeoff_total), { indent: true }), ...p.writeoff.map((w) => row(REASONS[w.reason], fmt(w.total), { indent: true })),
+        row('− Xarajatlar', fmt(p.expenses_total), { indent: true }), ...p.expenses.map((e) => row(CATS[e.category] || e.category, fmt(e.total), { indent: true })),
+        row('= Sof foyda', fmt(p.net_profit), { bold: true, note: `${p.net_margin}%` })])),
+      h('div', { class: 'cols' },
+        h('div', { class: 'card' }, h('h3', {}, 'Pul oqimi (kassa)'), tbl([row('Davr boshiga qoldiq', fmt(c.opening)), row('+ Kirim', fmt(c.inflow), { indent: true }), row('− Chiqim', fmt(c.outflow), { indent: true }),
+          row('= Davr oxiriga qoldiq', fmt(c.closing), { bold: true })]),
+          c.flows.length ? table(['Manba', 'Summa'], c.flows.sort((a, b) => b.total - a.total).map((x) => [CASH_KIND[x.kind] || x.kind, h('span', { class: x.total > 0 ? 'up' : 'down' }, signed(x.total))]), [1]) : null),
+        h('div', { class: 'card' }, h('h3', {}, 'Hozirgi holat'), tbl([row('Kassa (naqd + karta + o\'tkazma)', fmt(pos.cash)), row('Ombor qiymati (o\'rtacha tannarx)', fmt(pos.inventory)),
+          row('Mijozlar qarzi (nasiya)', fmt(pos.receivables)), row('Yetkazuvchilardagi avanslar', fmt(pos.advances)), row('− Yetkazuvchilarga qarzimiz', fmt(pos.payables), { indent: true }),
+          row('= Sof aktivlar', fmt(pos.net_assets), { bold: true })]), h('p', { class: 'mute' }, "Sof aktivlar = kassa + ombor + mijoz qarzi + avanslar − yetkazuvchi qarzi."))));
+  };
+  const d = h('input', { type: 'date', value: to, max: today(), onchange: (e) => { to = e.target.value || today(); load(); } });
+  const r = h('select', { onchange: (e) => { days = Number(e.target.value); load(); } }, [7, 14, 30, 90, 365].map((n) => h('option', { value: n, selected: n === days }, `${n} kun`)));
+  await load();
+  return h('div', {}, h('div', { class: 'row' }, h('span', { class: 'mute' }, 'Oxirgi sana:'), d, r), out);
+}
+
 // ---------- Admin: hujjatlar zanjiri (SAP: document flow) va yaxlitlik nazorati ----------
 async function flowView() {
   const out = h('div'), integ = h('div'), box = msgBox();
-  const TYPES = { sale: 'Sotuv / qaytarish', receipt: 'Kirim / storno', po: 'Buyurtma', payment: "Qarz to'lovi" };
+  const TYPES = { sale: 'Sotuv / qaytarish', receipt: 'Kirim / storno', po: 'Buyurtma', payment: "Mijoz qarz to'lovi", supplier_payment: "Yetkazuvchi to'lovi", cash_op: 'Kassa operatsiyasi', writeoff: 'Hisobdan chiqarish' };
   const MOVE = { sale: 'Sotuv', return: 'Qaytarish', receipt: 'Kirim', purchase: 'Buyurtma kirimi', opening: "Boshlang'ich qoldiq", receipt_reversal: 'Kirim storno' };
   const LEDGER = { sale_debt: 'Nasiya (sotuvdan)', payment: "To'lov", return_credit: 'Qaytarishdan qarz kamayishi' };
   const title = (f) => {
@@ -512,6 +651,9 @@ async function flowView() {
     if (f.type === 'sale') return `${d.kind === 'return' ? 'Qaytarish' : 'Sotuv'} #${d.id}`;
     if (f.type === 'receipt') return `${{ receipt: 'Kirim', opening: "Boshlang'ich qoldiq", reversal: 'Kirim storno' }[d.kind]} #${d.id}`;
     if (f.type === 'po') return `Buyurtma #${d.id}`;
+    if (f.type === 'supplier_payment') return `${d.kind === 'refund' ? 'Yetkazuvchi pul qaytardi' : "Yetkazuvchiga to'lov"} #${d.id}`;
+    if (f.type === 'cash_op') return `${CASH_KIND[d.kind]} #${d.id}`;
+    if (f.type === 'writeoff') return `Hisobdan chiqarish #${d.id}`;
     return `Qarz to'lovi #${d.id}`;
   };
   const sect = (name, node) => h('div', { class: 'card' }, h('h3', {}, name), node);
@@ -530,6 +672,8 @@ async function flowView() {
           f.lines.map((l) => [l.name, `${qf(l.qty)} ${l.unit}`, fmt(l.price ?? l.cost), fmt(l.line_total)]), [1, 2, 3])) : null,
         f.moves.length ? sect('Ombor harakatlari (ombor daftari)', table(['№', 'Mahsulot', 'Turi', 'Miqdor'], f.moves.map((m) => [m.id, m.product, MOVE[m.type] || m.type, (m.qty > 0 ? '+' : '') + qf(m.qty)]), [3])) : null,
         f.ledger.length ? sect('Mijoz daftari (nasiya)', table(['№', 'Turi', 'Summa'], f.ledger.map((l) => [l.id, LEDGER[l.kind] || l.kind, (l.amount > 0 ? '+' : '') + fmt(l.amount)]), [2])) : null,
+        f.supplier_ledger?.length ? sect('Yetkazuvchi daftari', table(['№', 'Yetkazuvchi', 'Turi', 'Summa'], f.supplier_ledger.map((l) => [l.id, l.supplier, { receipt: 'Kirim (qarz)', receipt_reversal: 'Kirim storno', payment: "To'lov / avans", refund: 'Pul qaytarildi' }[l.kind], signed(l.amount)]), [3])) : null,
+        f.cash?.length ? sect('Kassa daftari', table(['№', 'Hisob', 'Turi', 'Summa'], f.cash.map((c) => [c.id, METHOD[c.method], CASH_KIND[c.kind] || c.kind, signed(c.amount)]), [3])) : null,
       ].filter(Boolean));
       flash(box, '');
     } catch (e) { out.replaceChildren(); flash(box, e.message); }
@@ -554,9 +698,9 @@ async function flowView() {
 }
 
 const TABS = {
-  seller: [['sell', 'Sotuv', sellView], ['receipt', 'Kirim', receiptView], ['stock', 'Ombor', stockView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['mine', 'Sotuvlarim', mySalesView]],
-  admin: [['dash', 'Tahlil', dashboardView], ['stock', 'Ombor', stockView], ['offers', 'Xarid takliflari', offersView], ['orders', 'Buyurtmalar', ordersView],
-    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['sup', 'Yetkazuvchilar', suppliersView], ['flow', 'Hujjatlar', flowView], ['audit', 'Tarix', auditView], ['users', 'Foydalanuvchilar', usersView]],
+  seller: [['sell', 'Sotuv', sellView], ['receipt', 'Kirim', receiptView], ['supacct', 'Yetkazuvchi hisobi', supplierAccountView], ['cash', 'Kassa', cashView], ['stock', 'Ombor', stockView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['mine', 'Sotuvlarim', mySalesView]],
+  admin: [['dash', 'Tahlil', dashboardView], ['fin', 'Moliya', financeView], ['cash', 'Kassa', cashView], ['stock', 'Ombor', stockView], ['offers', 'Xarid takliflari', offersView], ['orders', 'Buyurtmalar', ordersView],
+    ['receipt', 'Kirim', receiptView], ['supacct', 'Yetkazuvchi hisobi', supplierAccountView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['sup', 'Yetkazuvchilar', suppliersView], ['flow', 'Hujjatlar', flowView], ['audit', 'Tarix', auditView], ['users', 'Foydalanuvchilar', usersView]],
 };
 
 async function render() {
