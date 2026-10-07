@@ -65,25 +65,35 @@ const cameraError = (e) => {
 };
 
 /**
- * Skanerni ochadi (to'liq ekran). onCode(code) -> { ok, msg, info? } — natija ekranda ko'rsatiladi,
- * skaner yopilmaydi (ketma-ket bir nechta mahsulotni skanerlash mumkin).
- * Qaytaradi: { close }.
+ * Skanerni ochadi (to'liq ekran): tepada holat/chiroq, o'rtada kamera va ramka, pastda `panel` (chaqiruvchi
+ * yangilab turadigan DOM — masalan jonli savat). Skaner yopilmaydi: ketma-ket bir nechta mahsulot skanerlanadi.
+ *   onCode(code) -> { ok, msg }   natija tepadagi holat satrida ko'rsatiladi
+ * Qaytaradi: { close, notify(msg, ok) }
  */
-export function openScanner({ onCode, onClose }) {
+export function openScanner({ onCode, onClose, panel, title = 'Skaner' }) {
   const el = (tag, attrs = {}, ...kids) => { const n = document.createElement(tag); Object.assign(n, attrs); n.append(...kids.filter((k) => k != null)); return n; };
   const video = el('video', { playsInline: true, muted: true, autoplay: true, className: 'scan-video' });
   const status = el('div', { className: 'scan-status', textContent: 'Kamera ochilmoqda...' });
-  const info = el('div', { className: 'scan-info' });
-  const torchBtn = el('button', { className: 'btn sec', textContent: '🔦', hidden: true, type: 'button', ariaLabel: 'Chiroq' });
-  const closeBtn = el('button', { className: 'btn', textContent: 'Tayyor', type: 'button' });
-  const manual = el('input', { placeholder: 'Kodni qo\'lda kiriting + Enter', inputMode: 'numeric', className: 'scan-manual' });
-  const overlay = el('div', { className: 'scan-overlay', role: 'dialog', ariaLabel: 'Shtrixkod skaneri' },
-    video, el('div', { className: 'scan-reticle' }), status,
-    el('div', { className: 'scan-bar' }, info, manual, el('div', { className: 'row', style: 'justify-content:space-between;margin:8px 0 0' }, torchBtn, closeBtn)));
+  const closeBtn = el('button', { className: 'scan-icon', type: 'button', textContent: '✕', ariaLabel: 'Yopish' });
+  const torchBtn = el('button', { className: 'scan-icon', type: 'button', textContent: '🔦', hidden: true, ariaLabel: 'Chiroq' });
+  const kbBtn = el('button', { className: 'scan-icon', type: 'button', textContent: '⌨', ariaLabel: 'Kodni qo\'lda kiritish' });
+  const manual = el('input', { placeholder: 'Kodni kiriting va Enter bosing', inputMode: 'numeric', className: 'scan-manual' });
+  const manualWrap = el('div', { className: 'scan-manualwrap', hidden: true }, manual);
+  const reticle = el('div', { className: 'scan-reticle' }, el('i', { className: 'c tl' }), el('i', { className: 'c tr' }), el('i', { className: 'c bl' }), el('i', { className: 'c br' }), el('b', { className: 'scan-line' }));
+  const top = el('div', { className: 'scan-top' }, closeBtn, el('div', { className: 'scan-title', textContent: title }), torchBtn, kbBtn);
+  const sheet = el('div', { className: 'scan-sheet' }, panel);
+  const overlay = el('div', { className: 'scan-overlay', role: 'dialog', ariaLabel: 'Shtrixkod skaneri' }, video, reticle, top, status, manualWrap, sheet);
   document.body.append(overlay);
   document.body.classList.add('scanning');
 
-  let stream, stopped = false, timer, last = { code: null, seen: 0 }, torchOn = false;
+  let stream, stopped = false, timer, last = { code: null, seen: 0 }, torchOn = false, statusTimer;
+  const notify = (msg, ok) => {
+    status.textContent = msg; status.className = 'scan-status show ' + (ok === true ? 'ok' : ok === false ? 'err' : '');
+    clearTimeout(statusTimer);
+    if (ok !== undefined) statusTimer = setTimeout(() => { status.className = 'scan-status'; }, 2200);
+    if (ok === true) { reticle.classList.remove('hit'); void reticle.offsetWidth; reticle.classList.add('hit'); beep(); navigator.vibrate?.(60); }
+    if (ok === false) navigator.vibrate?.([40, 40, 40]);
+  };
   const handle = async (code) => {
     const now = Date.now();
     // Kod ramkada turgan ekan, qayta qo'shilmaydi; ramkadan chiqib (1.2 s ko'rinmay), yana kirsa — yangi dona
@@ -91,14 +101,11 @@ export function openScanner({ onCode, onClose }) {
     last = { code, seen: now };
     if (same) return;
     const r = await onCode(code);
-    status.textContent = r.msg;
-    status.className = 'scan-status ' + (r.ok ? 'ok' : 'err');
-    if (r.info != null) info.textContent = r.info;
-    if (r.ok) { beep(); navigator.vibrate?.(60); } else navigator.vibrate?.([40, 40, 40]);
+    notify(r.msg, r.ok);
   };
   function close() {
     if (stopped) return; stopped = true;
-    clearTimeout(timer);
+    clearTimeout(timer); clearTimeout(statusTimer);
     stream?.getTracks().forEach((t) => t.stop());
     overlay.remove(); document.body.classList.remove('scanning');
     document.removeEventListener('keydown', onKey);
@@ -107,7 +114,8 @@ export function openScanner({ onCode, onClose }) {
   const onKey = (e) => { if (e.key === 'Escape') close(); };
   document.addEventListener('keydown', onKey);
   closeBtn.onclick = close;
-  manual.addEventListener('keydown', (e) => { if (e.key === 'Enter' && manual.value.trim()) { handle(manual.value.trim()); manual.value = ''; } });
+  kbBtn.onclick = () => { manualWrap.hidden = !manualWrap.hidden; if (!manualWrap.hidden) manual.focus(); };
+  manual.addEventListener('keydown', (e) => { if (e.key === 'Enter' && manual.value.trim()) { last = { code: null, seen: 0 }; handle(manual.value.trim()); manual.value = ''; } });
   torchBtn.onclick = async () => {
     torchOn = !torchOn;
     try { await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: torchOn }] }); torchBtn.classList.toggle('on', torchOn); } catch { torchOn = false; }
@@ -122,7 +130,7 @@ export function openScanner({ onCode, onClose }) {
       await video.play();
       torchBtn.hidden = !stream.getVideoTracks()[0].getCapabilities?.().torch;
       const decode = await makeDecoder(video);
-      status.textContent = 'Shtrixkodni ramkaga to\'g\'rilang';
+      notify('Shtrixkodni ramkaga to\'g\'rilang');
       const tick = async () => {
         if (stopped) return;
         try { const code = await decode(); if (code && !stopped) await handle(code); } catch { /* keyingi kadr */ }
@@ -130,9 +138,10 @@ export function openScanner({ onCode, onClose }) {
       };
       tick();
     } catch (e) {
-      status.textContent = cameraError(e); status.className = 'scan-status err';
-      manual.focus(); // kamera bo'lmasa ham qo'lda kiritish ishlaydi
+      notify(cameraError(e), false);
+      clearTimeout(statusTimer); // xato xabari yo'qolmasin
+      manualWrap.hidden = false; manual.focus(); // kamera bo'lmasa ham qo'lda kiritish ishlaydi
     }
   })();
-  return { close };
+  return { close, notify };
 }

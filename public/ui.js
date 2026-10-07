@@ -55,6 +55,7 @@ function barChart(items, { label, value, format = fmt, height = 160 } = {}) {
 }
 
 const msgBox = () => h('div');
+const stepper = (n, onMinus, onPlus) => h('div', { class: 'sc-step' }, h('button', { type: 'button', onclick: onMinus, 'aria-label': 'Kamaytirish' }, '−'), h('span', {}, qf(n)), h('button', { type: 'button', onclick: onPlus, 'aria-label': 'Ko\'paytirish' }, '+'));
 function flash(box, text, kind = 'err') { box.replaceChildren(text ? h('div', { class: 'msg ' + kind }, text) : ''); }
 const table = (head, rows, numCols = []) => h('div', { class: 'wrap' }, h('table', {},
   h('thead', {}, h('tr', {}, head.map((t, i) => h('th', { class: numCols.includes(i) ? 'n' : '' }, t)))),
@@ -102,17 +103,37 @@ async function sellView() {
   const matches = () => { const s = q.value.trim().toLowerCase(); return products.filter((p) => !s || p.name.toLowerCase().includes(s) || (p.sku || '').toLowerCase().includes(s)); };
   const drawList = () => list.replaceChildren(...matches().slice(0, 60).map((p) =>
     h('button', { disabled: p.stock <= 0, onclick: () => addToCart(p) }, h('span', {}, p.name), h('span', { class: 'mute' }, `${money(p.price)} · ${qf(p.stock)} ${p.unit}`))));
+  // Kamera rejimi: pastki panelda jonli savat, +/- tugmalar va skanerdan chiqmasdan "Sotish"
+  const scanPanel = h('div', { class: 'scan-cart' });
+  const drawScanPanel = (flashId) => {
+    const c = calc(); const qty = [...cart.values()].reduce((a, b) => a + b, 0);
+    scanPanel.replaceChildren(
+      h('div', { class: 'sc-list' }, cart.size ? [...cart].reverse().map(([id, n]) => {
+        const p = byId.get(id);
+        return h('div', { class: 'sc-row' + (id === flashId ? ' new' : '') },
+          h('div', { class: 'sc-name' }, h('b', {}, p.name), h('span', { class: 'mute' }, `${money(p.price)} · ${qf(p.stock)} ${p.unit}`)),
+          stepper(n, () => { n - 1 > 0 ? cart.set(id, n - 1) : cart.delete(id); drawCart(); }, () => { if (n + 1 <= p.stock) { cart.set(id, n + 1); drawCart(); } else state.scanner?.notify(`"${p.name}" omborda yetarli emas`, false); }),
+          h('div', { class: 'sc-sum' }, money(p.price * n)));
+      }) : h('p', { class: 'mute sc-empty' }, 'Mahsulot shtrixkodini ramkaga to\'g\'rilang')),
+      h('div', { class: 'sc-foot' }, h('div', {}, h('div', { class: 'mute' }, `${cart.size} xil · ${qf(qty)} dona${c.discount ? ' · chegirma bilan' : ''}`), h('div', { class: 'total' }, money(c.total))),
+        h('button', { class: 'btn sc-sell', disabled: !cart.size, onclick: async () => {
+          const r = await sell();
+          if (r.ok) state.scanner?.close(); else state.scanner?.notify(r.msg, false);
+        } }, 'Sotish')));
+  };
   const startScan = () => {
     state.scanner = openScanner({
+      title: 'Skanerlab sotish', panel: scanPanel,
       onClose: () => { state.scanner = null; drawCart(); drawList(); },
       onCode: async (code) => {
         const p = products.find((x) => x.sku === code);
         if (!p) return { ok: false, msg: `Topilmadi: ${code}` };
         const have = cart.get(p.id) || 0;
         if (have + 1 > p.stock) return { ok: false, msg: `"${p.name}" omborda yetarli emas (${qf(p.stock)})` };
-        cart.set(p.id, have + 1);
-        return { ok: true, msg: `✓ ${p.name} — ${have + 1} ta`, info: `Savatda: ${cart.size} xil · ${money(calc().total)}` };
+        cart.set(p.id, have + 1); drawCart(p.id);
+        return { ok: true, msg: `✓ ${p.name} — ${have + 1} ta` };
       } });
+    drawScanPanel();
   };
   q.addEventListener('keydown', (e) => { // klaviatura-skaner SKU ni yozib Enter bosadi
     if (e.key !== 'Enter') return;
@@ -129,8 +150,9 @@ async function sellView() {
     const pd = paid.value === '' ? total : Math.min(Math.round(Number(paid.value) || 0), total);
     return { ls, subtotal, discount, total, pd };
   };
-  const drawCart = () => {
+  const drawCart = (flashId) => {
     const c = calc();
+    if (state.scanner) drawScanPanel(flashId);
     cartEl.replaceChildren(cart.size ? table(['Mahsulot', 'Miqdor', 'Summa', ''], [...cart].map(([id, n]) => {
       const p = byId.get(id);
       const inp = h('input', { type: 'number', min: 0, step: 'any', value: n, onchange: () => { const v = Number(inp.value); v > 0 ? cart.set(id, Math.min(v, p.stock)) : cart.delete(id); drawCart(); } });
@@ -150,17 +172,17 @@ async function sellView() {
       for (const [id, n] of cart) byId.get(id).stock -= n;
       const receipt = { ...r, lines: c.ls };
       lastEl.replaceChildren(h('button', { class: 'btn sec', onclick: () => printReceipt(receipt) }, '🖨 Chekni chop etish'));
-      cart.clear(); dVal.value = 0; paid.value = ''; drawCart(); drawList(); q.focus();
-      if (cust.value) get('/api/customers').catch(() => {});
-    } catch (e) { flash(box, e.message); }
+      cart.clear(); dVal.value = 0; paid.value = ''; drawCart(); drawList();
+      return { ok: true };
+    } catch (e) { flash(box, e.message); return { ok: false, msg: e.message }; }
   };
   q.addEventListener('input', drawList); drawList(); drawCart();
-  return h('div', { class: 'cols' },
+  return h('div', {}, h('button', { class: 'btn scanbtn scanhero', onclick: startScan }, '📷 Skanerlab sotish'), h('div', { class: 'cols' },
     h('div', { class: 'card' }, h('h3', {}, 'Mahsulot tanlash'), h('div', { class: 'row' }, h('button', { class: 'btn scanbtn', onclick: startScan }, '📷 Skaner'), q), list),
     h('div', { class: 'card' }, h('h3', {}, 'Savat'), box, cartEl,
       h('div', { class: 'row' }, h('span', { class: 'mute' }, 'Chegirma:'), dVal, dType, cust),
       h('div', { class: 'row' }, h('span', { class: 'mute' }, "To'lov:"), paid, method),
-      h('div', { class: 'checkout' }, sumEl, h('button', { class: 'btn', style: 'width:100%', onclick: sell }, 'Sotish')), h('div', { style: 'margin-top:8px' }, lastEl)));
+      h('div', { class: 'checkout' }, sumEl, h('button', { class: 'btn', style: 'width:100%', onclick: sell }, 'Sotish')), h('div', { style: 'margin-top:8px' }, lastEl))));
 }
 
 // ---------- Kirim (sotuvchi va admin) ----------
@@ -177,6 +199,32 @@ async function receiptView() {
     h('input', { type: 'number', min: 0, step: 'any', value: l.qty, onchange: (e) => { l.qty = Number(e.target.value); } }),
     h('input', { type: 'number', min: 0, value: l.cost, onchange: (e) => { l.cost = Number(e.target.value); } }),
     h('button', { class: 'btn sec', onclick: () => { lines.splice(i, 1); draw(); } }, '✕')]), [1, 2]) : h('p', { class: 'mute' }, "Mahsulot qo'shing"));
+  const scanPanel = h('div', { class: 'scan-cart' });
+  const drawScanPanel = (flashId) => {
+    const qty = lines.reduce((a, l) => a + l.qty, 0);
+    scanPanel.replaceChildren(
+      h('div', { class: 'sc-list' }, lines.length ? [...lines].reverse().map((l) => h('div', { class: 'sc-row' + (l.id === flashId ? ' new' : '') },
+        h('div', { class: 'sc-name' }, h('b', {}, l.name), h('span', { class: 'mute' }, 'kirim narxi:'),
+          h('input', { class: 'sc-cost', type: 'number', min: 0, value: l.cost, onchange: (e) => { l.cost = Number(e.target.value); } })),
+        stepper(l.qty, () => { l.qty = Math.max(0, l.qty - 1); if (!l.qty) lines.splice(lines.indexOf(l), 1); drawScanPanel(); }, () => { l.qty += 1; drawScanPanel(); }),
+        h('div', { class: 'sc-sum' }, money(l.cost * l.qty)))) : h('p', { class: 'mute sc-empty' }, 'Kelgan mahsulot shtrixkodini skanerlang')),
+      h('div', { class: 'sc-foot' }, h('div', {}, h('div', { class: 'mute' }, `${lines.length} xil · ${qf(qty)} dona`), h('div', { class: 'total' }, money(lines.reduce((a, l) => a + l.cost * l.qty, 0)))),
+        h('button', { class: 'btn sc-sell', onclick: () => state.scanner?.close() }, 'Tayyor')));
+  };
+  const startScan = () => {
+    state.scanner = openScanner({
+      title: 'Kirim: skanerlash', panel: scanPanel,
+      onClose: () => { state.scanner = null; draw(); },
+      onCode: async (code) => {
+        const p = products.find((x) => x.sku === code);
+        if (!p) return { ok: false, msg: `Topilmadi: ${code}` };
+        let l = lines.find((x) => x.id === p.id);
+        if (l) l.qty += 1; else { l = { id: p.id, name: p.name, qty: 1, cost: p.cost || 0 }; lines.push(l); }
+        drawScanPanel(p.id);
+        return { ok: true, msg: `✓ ${p.name} — ${qf(l.qty)} ta` };
+      } });
+    drawScanPanel();
+  };
   const add = () => { const p = products.find((x) => x.id === Number(prod.value)); if (p && !lines.some((l) => l.id === p.id)) lines.push({ id: p.id, name: p.name, qty: 1, cost: p.cost || 0 }); draw(); };
   const loadHist = async () => {
     const rows = await get('/api/receipts?date=' + today());
@@ -195,7 +243,7 @@ async function receiptView() {
   draw(); loadHist();
   return h('div', {}, h('div', { class: 'card' }, h('h3', {}, 'Yangi kirim'), box,
     h('div', { class: 'row' }, sup, newSup, h('button', { class: 'btn sec', onclick: addSup }, "Qo'shish")),
-    h('div', { class: 'row' }, prod, h('button', { class: 'btn sec', onclick: add }, "+ Mahsulot")), area,
+    h('div', { class: 'row' }, prod, h('button', { class: 'btn sec', onclick: add }, "+ Mahsulot"), h('button', { class: 'btn', onclick: startScan }, '📷 Skaner')), area,
     h('div', { class: 'row', style: 'margin-top:10px' }, note, h('button', { class: 'btn', onclick: save }, 'Kirim qilish'))),
     h('div', { class: 'card' }, h('h3', {}, 'Bugungi kirimlar'), hist));
 }
