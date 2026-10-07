@@ -60,6 +60,8 @@ function flash(box, text, kind = 'err') { box.replaceChildren(text ? h('div', { 
 const table = (head, rows, numCols = []) => h('div', { class: 'wrap' }, h('table', {},
   h('thead', {}, h('tr', {}, head.map((t, i) => h('th', { class: numCols.includes(i) ? 'n' : '' }, t)))),
   h('tbody', {}, rows.map((r) => h('tr', {}, r.map((c, i) => h('td', { class: numCols.includes(i) ? 'n' : '' }, c)))))));
+const activeTag = (a) => h('span', { class: 'tag ' + (a ? 'ok' : 'cancelled') }, a ? 'Aktiv' : 'Noaktiv');
+const STATUS_OPTS = () => [h('option', { value: 'active' }, 'Aktiv'), h('option', { value: 'inactive' }, 'Noaktiv'), h('option', { value: 'all' }, 'Hammasi')];
 const stockTag = (p) => p.stock <= 0 ? h('span', { class: 'tag out' }, 'Tugagan') : p.stock <= p.min_stock ? h('span', { class: 'tag low' }, 'Kam') : h('span', { class: 'tag ok' }, 'Yetarli');
 
 // ---------- Kirish ----------
@@ -228,7 +230,12 @@ async function receiptView() {
   const add = () => { const p = products.find((x) => x.id === Number(prod.value)); if (p && !lines.some((l) => l.id === p.id)) lines.push({ id: p.id, name: p.name, qty: 1, cost: p.cost || 0 }); draw(); };
   const loadHist = async () => {
     const rows = await get('/api/receipts?date=' + today());
-    hist.replaceChildren(rows.length ? table(['Vaqt', 'Yetkazuvchi', 'Mahsulotlar', 'Summa'], rows.map((r) => [hhmm(r.created_at), r.supplier || '—', r.items, money(r.total)]), [3]) : h('p', { class: 'mute' }, 'Bugun kirim yo\'q'));
+    const reversed = new Set(rows.filter((r) => r.kind === 'reversal').map((r) => r.ref_receipt_id));
+    hist.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Yetkazuvchi', 'Mahsulotlar', 'Summa'].concat(isAdmin ? [''] : []), rows.map((r) => [r.id, hhmm(r.created_at), r.supplier || '—',
+      r.kind === 'reversal' ? h('span', { class: 'tag low' }, 'Storno: ' + r.items) : r.items, money(r.total)].concat(isAdmin ? [r.kind === 'receipt' && !reversed.has(r.id) ? h('button', { class: 'btn sec', onclick: async () => {
+        if (!confirm(`Kirim #${r.id} storno qilinsinmi? Tovar ombordan ayriladi, asl hujjat saqlanadi.`)) return;
+        try { await post(`/api/admin/receipts/${r.id}/reverse`); flash(box, 'Storno hujjati yaratildi', 'ok'); loadHist(); } catch (e) { flash(box, e.message); }
+      } }, 'Storno') : (r.kind === 'receipt' ? h('span', { class: 'mute' }, 'storno qilingan') : '')] : [])), [4]) : h('p', { class: 'mute' }, 'Bugun kirim yo\'q'));
   };
   const addSup = async () => {
     if (!newSup.value.trim()) return;
@@ -251,16 +258,23 @@ async function receiptView() {
 // ---------- Ombor (ikkala rol; admin tahrirlay oladi) ----------
 async function stockView() {
   const isAdmin = state.user.role === 'admin';
+  let status = 'active';
   let products = await get('/api/products');
+  const reload = async () => { products = await get('/api/products' + (isAdmin ? '?status=' + status : '')); draw(); };
   const out = h('div'), box = msgBox();
   const q = h('input', { placeholder: 'Qidirish...' });
-  const only = h('select', {}, h('option', { value: '' }, 'Hammasi'), h('option', { value: 'low' }, 'Faqat kam qolganlar'));
+  const only = h('select', {}, h('option', { value: '' }, 'Barcha qoldiq'), h('option', { value: 'low' }, 'Faqat kam qolganlar'));
+  const st = h('select', { onchange: (e) => { status = e.target.value; reload(); } }, STATUS_OPTS());
   const draw = () => {
     const s = q.value.toLowerCase();
     const rows = products.filter((p) => (!s || p.name.toLowerCase().includes(s) || (p.category || '').toLowerCase().includes(s) || (p.sku || '').toLowerCase().includes(s)) && (!only.value || p.stock <= p.min_stock));
-    const head = ['Mahsulot', 'Kategoriya', 'Qoldiq', 'Min.', 'Narx', 'Holat'].concat(isAdmin ? ['Tannarx', ''] : []);
+    const head = ['Mahsulot', 'Kategoriya', 'Qoldiq', 'Min.', 'Narx', 'Holat'].concat(isAdmin ? ['Tannarx', 'Status', ''] : []);
     out.replaceChildren(table(head, rows.map((p) => [p.name, p.category, `${qf(p.stock)} ${p.unit}`, qf(p.min_stock), fmt(p.price), stockTag(p)]
-      .concat(isAdmin ? [fmt(p.cost), h('button', { class: 'btn sec', onclick: () => edit(p) }, 'Tahrir')] : [])), [2, 3, 4, 6]));
+      .concat(isAdmin ? [fmt(p.cost), activeTag(p.active), h('span', { class: 'row', style: 'margin:0' }, h('button', { class: 'btn sec', onclick: () => edit(p) }, 'Tahrir'), h('button', { class: 'btn sec', onclick: () => setStatus(p) }, p.active ? 'Noaktiv qilish' : 'Faollashtirish'))] : [])), [2, 3, 4, 6]));
+  };
+  const setStatus = async (p) => {
+    if (p.active && !confirm(`"${p.name}" noaktiv qilinsinmi? Ma'lumot o'chirilmaydi, lekin yangi sotuv/kirimda ishlatib bo'lmaydi.`)) return;
+    try { await post(`/api/products/${p.id}/status`, { active: !p.active }); flash(box, p.active ? 'Noaktiv qilindi' : 'Faollashtirildi', 'ok'); reload(); } catch (e) { flash(box, e.message); }
   };
   const form = h('div');
   const edit = (p) => {
@@ -270,13 +284,13 @@ async function stockView() {
       h('div', { class: 'row' }, field('name', 'Nomi'), field('sku', 'SKU'), field('category', 'Kategoriya'), field('unit', 'Birlik')),
       h('div', { class: 'row' }, field('price', 'Sotuv narxi', 'number'), field('cost', 'Tannarx', 'number'), field('min_stock', 'Minimal qoldiq', 'number'), p ? null : field('stock', 'Boshlang\'ich qoldiq', 'number')),
       h('div', { class: 'row' }, h('button', { class: 'btn', onclick: async () => {
-        try { p ? await api('PUT', '/api/products/' + p.id, f) : await post('/api/products', f); form.replaceChildren(); products = await get('/api/products'); draw(); flash(box, 'Saqlandi', 'ok'); } catch (e) { flash(box, e.message); }
+        try { p ? await api('PUT', '/api/products/' + p.id, f) : await post('/api/products', f); form.replaceChildren(); await reload(); flash(box, 'Saqlandi', 'ok'); } catch (e) { flash(box, e.message); }
       } }, 'Saqlash'), h('button', { class: 'btn sec', onclick: () => form.replaceChildren() }, 'Bekor'),
-      p ? h('button', { class: 'btn bad', onclick: async () => { if (!confirm('Mahsulot arxivlansinmi?')) return; await api('PUT', '/api/products/' + p.id, { ...f, active: false }); form.replaceChildren(); products = await get('/api/products'); draw(); } }, 'Arxivlash') : null)));
+      null)));
     form.scrollIntoView({ behavior: 'smooth' });
   };
   q.addEventListener('input', draw); only.addEventListener('change', draw); draw();
-  return h('div', {}, box, form, h('div', { class: 'card' }, h('div', { class: 'row' }, q, only, isAdmin ? h('button', { class: 'btn', onclick: () => edit(null) }, "+ Yangi mahsulot") : null), out));
+  return h('div', {}, box, form, h('div', { class: 'card' }, h('div', { class: 'row' }, q, only, isAdmin ? st : null, isAdmin ? h('button', { class: 'btn', onclick: () => edit(null) }, "+ Yangi mahsulot") : null), out));
 }
 
 // ---------- Sotuvchi: bugungi sotuvlar ----------
@@ -386,8 +400,8 @@ async function usersView() {
   const box = msgBox(), out = h('div'); const f = { username: '', name: '', password: '', role: 'seller' };
   const load = async () => {
     const us = await get('/api/admin/users');
-    out.replaceChildren(table(['Login', 'Ism', 'Rol', 'Holat', ''], us.map((u) => [u.username, u.name, u.role === 'admin' ? 'Admin' : 'Sotuvchi', u.active ? 'Faol' : 'O\'chirilgan',
-      h('span', { class: 'row' }, h('button', { class: 'btn sec', onclick: async () => { try { await api('PUT', '/api/admin/users/' + u.id, { active: !u.active }); load(); } catch (e) { flash(box, e.message); } } }, u.active ? 'O\'chirish' : 'Yoqish'),
+    out.replaceChildren(table(['Login', 'Ism', 'Rol', 'Holat', ''], us.map((u) => [u.username, u.name, u.role === 'admin' ? 'Admin' : 'Sotuvchi', activeTag(u.active),
+      h('span', { class: 'row' }, h('button', { class: 'btn sec', onclick: async () => { try { await api('PUT', '/api/admin/users/' + u.id, { active: !u.active }); load(); } catch (e) { flash(box, e.message); } } }, u.active ? 'Noaktiv qilish' : 'Faollashtirish'),
         h('button', { class: 'btn sec', onclick: async () => { const pw = prompt('Yangi parol (kamida 6 belgi)'); if (pw) try { await api('PUT', '/api/admin/users/' + u.id, { password: pw }); flash(box, 'Parol almashtirildi', 'ok'); } catch (e) { flash(box, e.message); } } }, 'Parol'))])));
   };
   const inp = (k, ph, type = 'text') => h('input', { placeholder: ph, type, oninput: (e) => { f[k] = e.target.value; } });
@@ -426,26 +440,68 @@ async function returnsView() {
 
 // ---------- Mijozlar va nasiya ----------
 async function customersView() {
-  const box = msgBox(), out = h('div'); const f = { name: '', phone: '' };
+  const isAdmin = state.user.role === 'admin';
+  const box = msgBox(), out = h('div'); const f = { name: '', phone: '' }; let status = 'active';
   const load = async () => {
-    const cs = await get('/api/customers');
-    out.replaceChildren(cs.length ? table(['Mijoz', 'Telefon', 'Qarz', ''], cs.map((c) => [c.name, c.phone, c.balance ? h('b', {}, money(c.balance)) : '—',
-      c.balance ? h('button', { class: 'btn sec', onclick: async () => {
+    const cs = await get('/api/customers' + (isAdmin ? '?status=' + status : ''));
+    out.replaceChildren(cs.length ? table(['Mijoz', 'Telefon', 'Qarz'].concat(isAdmin ? ['Status'] : []).concat(['']), cs.map((c) => [c.name, c.phone, c.balance ? h('b', {}, money(c.balance)) : '—']
+      .concat(isAdmin ? [activeTag(c.active)] : [])
+      .concat([h('span', { class: 'row', style: 'margin:0' }, c.balance ? h('button', { class: 'btn sec', onclick: async () => {
         const v = prompt(`${c.name}: to'lov summasi (qarz ${fmt(c.balance)})`, c.balance); if (!v) return;
         try { await post(`/api/customers/${c.id}/payments`, { amount: Number(v) }); flash(box, "To'lov qabul qilindi", 'ok'); load(); } catch (e) { flash(box, e.message); }
-      } }, "To'lov qabul qilish") : '']), [2]) : h('p', { class: 'mute' }, 'Mijozlar yo\'q'));
+      } }, "To'lov qabul qilish") : null,
+      isAdmin ? h('button', { class: 'btn sec', onclick: async () => {
+        if (c.active && !confirm(`"${c.name}" noaktiv qilinsinmi? Ma'lumot o'chirilmaydi.`)) return;
+        try { await post(`/api/customers/${c.id}/status`, { active: !c.active }); load(); } catch (e) { flash(box, e.message); }
+      } }, c.active ? 'Noaktiv qilish' : 'Faollashtirish') : null)])), [2]) : h('p', { class: 'mute' }, 'Mijozlar yo\'q'));
   };
   const inp = (k, ph) => h('input', { placeholder: ph, oninput: (e) => { f[k] = e.target.value; } });
   await load();
   return h('div', {}, box, h('div', { class: 'card' }, h('h3', {}, 'Yangi mijoz'), h('div', { class: 'row' }, inp('name', 'Ism'), inp('phone', 'Telefon'),
     h('button', { class: 'btn', onclick: async () => { try { await post('/api/customers', f); flash(box, "Qo'shildi", 'ok'); load(); } catch (e) { flash(box, e.message); } } }, "Qo'shish"))),
-    h('div', { class: 'card' }, h('h3', {}, 'Nasiya (qarzdorlar)'), out));
+    h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Nasiya (qarzdorlar)'), isAdmin ? h('select', { onchange: (e) => { status = e.target.value; load(); } }, STATUS_OPTS()) : null), out));
+}
+
+// ---------- Admin: yetkazib beruvchilar ----------
+async function suppliersView() {
+  const box = msgBox(), out = h('div'); const f = { name: '', phone: '' }; let status = 'active';
+  const load = async () => {
+    const ss = await get('/api/suppliers?status=' + status);
+    out.replaceChildren(ss.length ? table(['Nomi', 'Telefon', 'Status', ''], ss.map((x) => [x.name, x.phone, activeTag(x.active),
+      h('button', { class: 'btn sec', onclick: async () => {
+        if (x.active && !confirm(`"${x.name}" noaktiv qilinsinmi? Ma'lumot o'chirilmaydi.`)) return;
+        try { await post(`/api/suppliers/${x.id}/status`, { active: !x.active }); load(); } catch (e) { flash(box, e.message); }
+      } }, x.active ? 'Noaktiv qilish' : 'Faollashtirish')])) : h('p', { class: 'mute' }, 'Yetkazib beruvchilar yo\'q'));
+  };
+  const inp = (k, ph) => h('input', { placeholder: ph, oninput: (e) => { f[k] = e.target.value; } });
+  await load();
+  return h('div', {}, box, h('div', { class: 'card' }, h('h3', {}, 'Yangi yetkazib beruvchi'), h('div', { class: 'row' }, inp('name', 'Nomi'), inp('phone', 'Telefon'),
+    h('button', { class: 'btn', onclick: async () => { try { await post('/api/suppliers', f); flash(box, "Qo'shildi", 'ok'); load(); } catch (e) { flash(box, e.message); } } }, "Qo'shish"))),
+    h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Yetkazib beruvchilar'), h('select', { onchange: (e) => { status = e.target.value; load(); } }, STATUS_OPTS())), out));
+}
+
+// ---------- Admin: o'zgarishlar tarixi (audit) ----------
+async function auditView() {
+  let tbl = '';
+  const out = h('div');
+  const T = { products: 'Mahsulot', customers: 'Mijoz', suppliers: 'Yetkazib beruvchi', users: 'Foydalanuvchi', purchase_orders: 'Buyurtma' };
+  const F = { price: 'Narx', cost: 'Tannarx', name: 'Nomi', sku: 'SKU', category: 'Kategoriya', unit: 'Birlik', min_stock: 'Min. qoldiq', active: 'Holat', phone: 'Telefon', role: 'Rol', username: 'Login', password_hash: 'Parol', status: 'Status', supplier_id: 'Yetkazuvchi' };
+  const val = (f, v) => f === 'active' ? (v === 'true' ? 'Aktiv' : 'Noaktiv') : v;
+  const load = async () => {
+    const rows = await get('/api/admin/change-log' + (tbl ? '?table=' + tbl : ''));
+    out.replaceChildren(rows.length ? table(['Vaqt', 'Kim', 'Obyekt', 'Amal', 'Eski → Yangi'], rows.map((r) => [hhmm(r.created_at), r.user || '—', `${T[r.table_name] || r.table_name}: ${r.label || '#' + r.record_id}`,
+      r.action === 'I' ? 'Yaratildi' : F[r.field] || r.field, r.action === 'I' ? '' : `${val(r.field, r.old_value) ?? '—'} → ${val(r.field, r.new_value) ?? '—'}`])) : h('p', { class: 'mute' }, 'Tarix bo\'sh'));
+  };
+  await load();
+  return h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, "O'zgarishlar tarixi"),
+    h('select', { onchange: (e) => { tbl = e.target.value; load(); } }, h('option', { value: '' }, 'Hammasi'), Object.entries(T).map(([k, v]) => h('option', { value: k }, v)))),
+    h('p', { class: 'mute' }, "Ma'lumotlar hech qachon o'chirilmaydi: faqat noaktiv qilinadi. Hujjatlar (sotuv, kirim) o'zgarmaydi — qaytarish/storno bilan tuzatiladi."), out);
 }
 
 const TABS = {
   seller: [['sell', 'Sotuv', sellView], ['receipt', 'Kirim', receiptView], ['stock', 'Ombor', stockView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['mine', 'Sotuvlarim', mySalesView]],
   admin: [['dash', 'Tahlil', dashboardView], ['stock', 'Ombor', stockView], ['offers', 'Xarid takliflari', offersView], ['orders', 'Buyurtmalar', ordersView],
-    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['users', 'Foydalanuvchilar', usersView]],
+    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['sup', 'Yetkazuvchilar', suppliersView], ['audit', 'Tarix', auditView], ['users', 'Foydalanuvchilar', usersView]],
 };
 
 async function render() {

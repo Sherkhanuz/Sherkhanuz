@@ -40,6 +40,8 @@ export function createHandler(db) {
     routes.push({ method, re, keys, roles, handler });
   };
   const idArg = (v) => num(v, 'id', { int: true, min: 1 });
+  // Barcha yozuvlar tranzaksiyada; foydalanuvchi id si change_log trigger'i uchun saqlanadi
+  const txu = (user, fn) => db.tx(async (t) => { await t.q("SELECT set_config('app.user_id', ?, true)", [String(user.id)]); return fn(t); });
 
   // ---------- Auth ----------
   const WINDOW = "interval '15 minutes'";
@@ -53,24 +55,25 @@ export function createHandler(db) {
         t = CASE WHEN login_attempts.t < now() - ${WINDOW} THEN now() ELSE login_attempts.t END`, [ip]);
       throw new HttpError(401, 'Login yoki parol xato');
     }
-    await db.run('DELETE FROM login_attempts WHERE ip=?', [ip]);
-    await db.run("DELETE FROM sessions WHERE created_at < now() - interval '12 hours'");
+    await db.run('UPDATE login_attempts SET n=0 WHERE ip=?', [ip]);
     const token = randomBytes(32).toString('hex');
     await db.run('INSERT INTO sessions(token,user_id) VALUES(?,?)', [token, u.id]);
     res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${12 * 3600}${secure ? '; Secure' : ''}`);
     return { id: u.id, name: u.name, role: u.role };
   });
   route('POST', '/api/logout', [], async ({ req, res }) => {
-    await db.run('DELETE FROM sessions WHERE token=?', [cookie(req).sid || '']);
+    await db.run('UPDATE sessions SET revoked=TRUE WHERE token=?', [cookie(req).sid || '']);
     res.setHeader('Set-Cookie', 'sid=; HttpOnly; Path=/; Max-Age=0');
     return { ok: true };
   });
   route('GET', '/api/me', [], ({ user }) => user);
 
   // ---------- Mahsulotlar / ombor ----------
-  route('GET', '/api/products', ['admin', 'seller'], ({ user }) => {
+  // Holat filtri: faqat admin noaktivlarni ko'ra oladi; boshqa hamma joyda faqat aktiv
+  const statusWhere = (q, user, col = 'active') => (user.role !== 'admin' || !q.status || q.status === 'active' ? col : q.status === 'inactive' ? `NOT ${col}` : 'TRUE');
+  route('GET', '/api/products', ['admin', 'seller'], ({ user, query }) => {
     const cols = user.role === 'admin' ? '*' : 'id,sku,name,category,unit,price,stock,min_stock,active';
-    return db.q(`SELECT ${cols} FROM products WHERE active ORDER BY name`);
+    return db.q(`SELECT ${cols} FROM products WHERE ${statusWhere(query, user)} ORDER BY name`);
   });
   const productBody = (b) => ({
     sku: b.sku ? str(b.sku, 'SKU / shtrixkod', 50) : null, name: str(b.name, 'Nomi'),
@@ -82,7 +85,7 @@ export function createHandler(db) {
     const p = productBody(body);
     const stock = num(body.stock ?? 0, 'Qoldiq');
     try {
-      return await db.tx(async (t) => {
+      return await txu(user, async (t) => {
         const { id } = await t.one(`INSERT INTO products(sku,name,category,unit,price,cost,stock,min_stock)
           VALUES(?,?,?,?,?,?,?,?) RETURNING id`, [p.sku, p.name, p.category, p.unit, p.price, p.cost, stock, p.min_stock]);
         if (stock) await t.run('INSERT INTO stock_moves(product_id,type,qty,user_id) VALUES(?,?,?,?)', [id, 'initial', stock, user.id]);
@@ -90,29 +93,58 @@ export function createHandler(db) {
       });
     } catch (e) { if (isUnique(e)) throw bad('Bu SKU band'); throw e; }
   });
-  route('PUT', '/api/products/:id', ['admin'], async ({ body, params }) => {
+  route('PUT', '/api/products/:id', ['admin'], async ({ body, params, user }) => {
     const p = productBody(body);
     try {
-      const n = await db.run(`UPDATE products SET sku=?,name=?,category=?,unit=?,price=?,cost=?,min_stock=?,active=? WHERE id=?`,
-        [p.sku, p.name, p.category, p.unit, p.price, p.cost, p.min_stock, body.active !== false, idArg(params.id)]);
+      const n = await txu(user, (t) => t.run(`UPDATE products SET sku=?,name=?,category=?,unit=?,price=?,cost=?,min_stock=? WHERE id=?`,
+        [p.sku, p.name, p.category, p.unit, p.price, p.cost, p.min_stock, idArg(params.id)]));
       if (!n) throw new HttpError(404, 'Mahsulot topilmadi');
     } catch (e) { if (isUnique(e)) throw bad('Bu SKU band'); throw e; }
     return { ok: true };
   });
 
+  // Holat o'zgartirish (o'chirish o'rniga). Noaktiv bo'lsa yangi hujjatlarda ishlatib bo'lmaydi, tarix saqlanadi.
+  route('POST', '/api/products/:id/status', ['admin'], ({ params, body, user }) => txu(user, async (t) => {
+    if (typeof body.active !== 'boolean') throw bad('active (true/false) kerak');
+    const id = idArg(params.id);
+    const p = await t.one('SELECT id,name,stock,active FROM products WHERE id=? FOR UPDATE', [id]);
+    if (!p) throw new HttpError(404, 'Mahsulot topilmadi');
+    if (!body.active && p.active) {
+      if (p.stock !== 0) throw new HttpError(409, `Qoldiq ${p.stock} — noaktiv qilishdan oldin qoldiq 0 bo'lishi kerak`);
+      if (await t.one("SELECT 1 x FROM po_items i JOIN purchase_orders o ON o.id=i.po_id WHERE i.product_id=? AND o.status='ordered' LIMIT 1", [id])) throw new HttpError(409, 'Mahsulot ochiq buyurtmada bor');
+    }
+    await t.run('UPDATE products SET active=? WHERE id=?', [body.active, id]);
+    return { ok: true, active: body.active };
+  }));
+
   // ---------- Yetkazib beruvchilar va mijozlar ----------
-  route('GET', '/api/suppliers', ['admin', 'seller'], () => db.q('SELECT * FROM suppliers ORDER BY name'));
-  route('POST', '/api/suppliers', ['admin', 'seller'], async ({ body }) => {
+  route('GET', '/api/suppliers', ['admin', 'seller'], ({ user, query }) => db.q(`SELECT * FROM suppliers WHERE ${statusWhere(query, user)} ORDER BY name`));
+  route('POST', '/api/suppliers', ['admin', 'seller'], async ({ body, user }) => {
     try {
-      return await db.one('INSERT INTO suppliers(name,phone) VALUES(?,?) RETURNING id', [str(body.name, 'Nomi'), String(body.phone || '').slice(0, 40)]);
+      return await txu(user, (t) => t.one('INSERT INTO suppliers(name,phone) VALUES(?,?) RETURNING id', [str(body.name, 'Nomi'), String(body.phone || '').slice(0, 40)]));
     } catch (e) { if (isUnique(e)) throw bad('Bunday yetkazib beruvchi bor'); throw e; }
   });
-  route('GET', '/api/customers', ['admin', 'seller'], () => db.q('SELECT id,name,phone,balance FROM customers ORDER BY name'));
-  route('POST', '/api/customers', ['admin', 'seller'], ({ body }) =>
-    db.one('INSERT INTO customers(name,phone) VALUES(?,?) RETURNING id', [str(body.name, 'Ism', 80), String(body.phone || '').slice(0, 40)]));
+  route('POST', '/api/suppliers/:id/status', ['admin'], ({ params, body, user }) => txu(user, async (t) => {
+    if (typeof body.active !== 'boolean') throw bad('active (true/false) kerak');
+    const id = idArg(params.id);
+    if (!body.active && await t.one("SELECT 1 x FROM purchase_orders WHERE supplier_id=? AND status='ordered' LIMIT 1", [id])) throw new HttpError(409, 'Ochiq buyurtmasi bor yetkazib beruvchini noaktiv qilib bo\'lmaydi');
+    if (!(await t.run('UPDATE suppliers SET active=? WHERE id=?', [body.active, id]))) throw new HttpError(404, 'Topilmadi');
+    return { ok: true, active: body.active };
+  }));
+  route('GET', '/api/customers', ['admin', 'seller'], ({ user, query }) => db.q(`SELECT id,name,phone,balance,active FROM customers WHERE ${statusWhere(query, user)} ORDER BY name`));
+  route('POST', '/api/customers', ['admin', 'seller'], ({ body, user }) =>
+    txu(user, (t) => t.one('INSERT INTO customers(name,phone) VALUES(?,?) RETURNING id', [str(body.name, 'Ism', 80), String(body.phone || '').slice(0, 40)])));
+  route('POST', '/api/customers/:id/status', ['admin'], ({ params, body, user }) => txu(user, async (t) => {
+    if (typeof body.active !== 'boolean') throw bad('active (true/false) kerak');
+    const c = await t.one('SELECT id,balance FROM customers WHERE id=? FOR UPDATE', [idArg(params.id)]);
+    if (!c) throw new HttpError(404, 'Mijoz topilmadi');
+    if (!body.active && c.balance > 0) throw new HttpError(409, `Mijozning qarzi bor (${c.balance}) — avval to'lov qabul qiling`);
+    await t.run('UPDATE customers SET active=? WHERE id=?', [body.active, c.id]);
+    return { ok: true, active: body.active };
+  }));
   route('POST', '/api/customers/:id/payments', ['admin', 'seller'], ({ body, params, user }) => {
     const amount = num(body.amount, 'Summa', { int: true, min: 1 });
-    return db.tx(async (t) => {
+    return txu(user, async (t) => {
       const c = await t.one('UPDATE customers SET balance = balance - ? WHERE id=? AND balance >= ? RETURNING balance', [amount, idArg(params.id), amount]);
       if (!c) throw new HttpError(409, 'Summa mijoz qarzidan oshib ketdi yoki mijoz topilmadi');
       await t.run('INSERT INTO debt_payments(customer_id,user_id,amount) VALUES(?,?,?)', [params.id, user.id, amount]);
@@ -137,7 +169,7 @@ export function createHandler(db) {
     const items = lines(body.items);
     const method = ['cash', 'card', 'transfer'].includes(body.method) ? body.method : 'cash';
     const customer_id = body.customer_id ? idArg(body.customer_id) : null;
-    return db.tx(async (t) => {
+    return txu(user, async (t) => {
       const rows = [];
       let subtotal = 0;
       for (const it of items) {
@@ -158,7 +190,7 @@ export function createHandler(db) {
       const paid = body.paid == null || body.paid === '' ? total : num(body.paid, 'To\'langan', { int: true });
       if (paid > total) throw bad('To\'langan summa jami summadan oshmasin');
       if (paid < total && !customer_id) throw bad('Nasiya uchun mijozni tanlang');
-      if (customer_id && !(await t.one('SELECT 1 x FROM customers WHERE id=?', [customer_id]))) throw bad('Mijoz topilmadi');
+      if (customer_id && !(await t.one('SELECT 1 x FROM customers WHERE id=? AND active', [customer_id]))) throw bad('Mijoz topilmadi yoki noaktiv');
 
       const { id: sid } = await t.one('INSERT INTO sales(user_id,customer_id,discount,total,paid,method) VALUES(?,?,?,?,?,?) RETURNING id',
         [user.id, customer_id, discount, total, paid, method]);
@@ -201,7 +233,7 @@ export function createHandler(db) {
     if (!Array.isArray(body.items) || !body.items.length) throw bad('Qaytariladigan mahsulot yo\'q');
     const toDebt = body.refund === 'debt';
     const sale_id = idArg(body.sale_id);
-    return db.tx(async (t) => {
+    return txu(user, async (t) => {
       const sale = await t.one("SELECT id,customer_id FROM sales WHERE id=? AND kind='sale' FOR UPDATE", [sale_id]);
       if (!sale) throw new HttpError(404, 'Sotuv topilmadi');
       if (toDebt && !sale.customer_id) throw bad('Bu sotuvda mijoz yo\'q');
@@ -241,32 +273,60 @@ export function createHandler(db) {
 
   // ---------- Kirim ----------
   const receiveStock = async (t, { items, supplier_id, note, user, source }) => {
-    const { id: rid } = await t.one('INSERT INTO receipts(user_id,supplier_id,note) VALUES(?,?,?) RETURNING id', [user.id, supplier_id ?? null, note]);
-    let total = 0;
+    const total = items.reduce((a, it) => a + Math.round(it.cost * it.qty), 0); // hujjat o'zgarmas: jami oldindan
+    const { id: rid } = await t.one('INSERT INTO receipts(user_id,supplier_id,note,total) VALUES(?,?,?,?) RETURNING id', [user.id, supplier_id ?? null, note, total]);
     for (const it of items) {
       const p = await t.one('SELECT id FROM products WHERE id=? AND active', [it.product_id]);
-      if (!p) throw bad('Mahsulot topilmadi');
-      total += Math.round(it.cost * it.qty);
+      if (!p) throw bad('Mahsulot topilmadi yoki noaktiv');
       await t.run('INSERT INTO receipt_items(receipt_id,product_id,qty,cost) VALUES(?,?,?,?)', [rid, it.product_id, it.qty, it.cost]);
       await t.run('UPDATE products SET stock=stock+?, cost=? WHERE id=?', [it.qty, it.cost, it.product_id]);
       await t.run('INSERT INTO stock_moves(product_id,type,qty,ref_id,user_id) VALUES(?,?,?,?,?)', [it.product_id, source, it.qty, rid, user.id]);
     }
-    await t.run('UPDATE receipts SET total=? WHERE id=?', [total, rid]);
     return { id: rid, total };
   };
   route('POST', '/api/receipts', ['admin', 'seller'], async ({ body, user }) => {
     const items = lines(body.items, { cost: true });
     const supplier_id = body.supplier_id ? idArg(body.supplier_id) : null;
-    if (supplier_id && !(await db.one('SELECT 1 x FROM suppliers WHERE id=?', [supplier_id]))) throw bad('Yetkazib beruvchi topilmadi');
-    return db.tx((t) => receiveStock(t, { items, supplier_id, note: String(body.note || '').slice(0, 300), user, source: 'receipt' }));
+    if (supplier_id && !(await db.one('SELECT 1 x FROM suppliers WHERE id=? AND active', [supplier_id]))) throw bad('Yetkazib beruvchi topilmadi yoki noaktiv');
+    return txu(user, (t) => receiveStock(t, { items, supplier_id, note: String(body.note || '').slice(0, 300), user, source: 'receipt' }));
   });
   route('GET', '/api/receipts', ['admin', 'seller'], ({ query, user }) => {
     const date = dateArg(query.date, localToday());
     const own = user.role === 'seller' ? 'AND r.user_id=?' : '';
-    return db.q(`SELECT r.id,r.total,r.note,r.created_at,u.name "user",sp.name supplier,
+    return db.q(`SELECT r.id,r.kind,r.ref_receipt_id,r.total,r.note,r.created_at,u.name "user",sp.name supplier,
         (SELECT string_agg(p.name || ' ×' || i.qty::text, ', ' ORDER BY i.id) FROM receipt_items i JOIN products p ON p.id=i.product_id WHERE i.receipt_id=r.id) items
       FROM receipts r JOIN users u ON u.id=r.user_id LEFT JOIN suppliers sp ON sp.id=r.supplier_id
       WHERE ${localDate('r.created_at')} = ?::date ${own} ORDER BY r.id DESC LIMIT 500`, user.role === 'seller' ? [date, user.id] : [date]);
+  });
+
+  // Kirimni storno qilish (SAP: MIGO 102): asl hujjat o'zgarmaydi, teskari hujjat yaratiladi
+  route('POST', '/api/admin/receipts/:id/reverse', ['admin'], ({ params, user }) => txu(user, async (t) => {
+    const r = await t.one("SELECT * FROM receipts WHERE id=? AND kind='receipt' FOR UPDATE", [idArg(params.id)]);
+    if (!r) throw new HttpError(404, 'Kirim topilmadi');
+    if (await t.one('SELECT 1 x FROM receipts WHERE ref_receipt_id=?', [r.id])) throw new HttpError(409, 'Bu kirim allaqachon storno qilingan');
+    const items = await t.q('SELECT i.product_id,i.qty,i.cost,p.name FROM receipt_items i JOIN products p ON p.id=i.product_id WHERE i.receipt_id=? ORDER BY i.product_id', [r.id]);
+    const { id } = await t.one("INSERT INTO receipts(user_id,supplier_id,kind,ref_receipt_id,note,total) VALUES(?,?,'reversal',?,?,?) RETURNING id",
+      [user.id, r.supplier_id, r.id, `Storno: kirim #${r.id}`, -r.total]);
+    for (const it of items) {
+      const u = await t.one('UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ? RETURNING stock', [it.qty, it.product_id, it.qty]);
+      if (!u) throw new HttpError(409, `"${it.name}" omborda yetarli emas — storno mumkin emas (tovar allaqachon sotilgan)`);
+      await t.run('INSERT INTO receipt_items(receipt_id,product_id,qty,cost) VALUES(?,?,?,?)', [id, it.product_id, -it.qty, it.cost]);
+      await t.run('INSERT INTO stock_moves(product_id,type,qty,ref_id,user_id) VALUES(?,?,?,?,?)', [it.product_id, 'receipt_reversal', -it.qty, id, user.id]);
+    }
+    return { id, total: -r.total };
+  }));
+
+  // O'zgarishlar tarixi (audit)
+  route('GET', '/api/admin/change-log', ['admin'], ({ query }) => {
+    const where = []; const args = [];
+    if (query.table) { where.push('c.table_name=?'); args.push(String(query.table)); }
+    if (query.record_id) { where.push('c.record_id=?'); args.push(idArg(query.record_id)); }
+    const lim = query.limit ? Math.min(num(query.limit, 'limit', { int: true, min: 1 }), 500) : 200;
+    return db.q(`SELECT c.id,c.table_name,c.record_id,c.action,c.field,c.old_value,c.new_value,c.created_at,u.name "user",
+        CASE c.table_name WHEN 'products' THEN (SELECT name FROM products WHERE id=c.record_id)
+          WHEN 'customers' THEN (SELECT name FROM customers WHERE id=c.record_id) WHEN 'suppliers' THEN (SELECT name FROM suppliers WHERE id=c.record_id)
+          WHEN 'users' THEN (SELECT username FROM users WHERE id=c.record_id) ELSE '#' || c.record_id END label
+      FROM change_log c LEFT JOIN users u ON u.id=c.user_id ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY c.id DESC LIMIT ${lim}`, args);
   });
 
   // ---------- Admin: tahlil ----------
@@ -342,7 +402,7 @@ export function createHandler(db) {
         (SELECT COALESCE(SUM(pi.qty),0) FROM po_items pi JOIN purchase_orders o ON o.id=pi.po_id
           WHERE pi.product_id=p.id AND o.status='ordered') on_order
       FROM products p WHERE p.active`, [addDays(today, -window + 1), today]);
-    const sup = new Map((await db.q('SELECT id,name,phone FROM suppliers')).map((s) => [s.id, s]));
+    const sup = new Map((await db.q('SELECT id,name,phone FROM suppliers WHERE active')).map((s) => [s.id, s]));
     const out = [];
     for (const r of rows) {
       const daily = Math.max(r.sold, 0) / window;
@@ -370,7 +430,8 @@ export function createHandler(db) {
   route('POST', '/api/admin/purchase-orders', ['admin'], ({ body, user }) => {
     const items = lines(body.items, { cost: true });
     const supplier_id = body.supplier_id ? idArg(body.supplier_id) : null;
-    return db.tx(async (t) => {
+    return txu(user, async (t) => {
+      if (supplier_id && !(await t.one('SELECT 1 x FROM suppliers WHERE id=? AND active', [supplier_id]))) throw bad('Yetkazib beruvchi topilmadi yoki noaktiv');
       let total = 0;
       for (const it of items) {
         if (!(await t.one('SELECT 1 x FROM products WHERE id=?', [it.product_id]))) throw bad('Mahsulot topilmadi');
@@ -388,7 +449,7 @@ export function createHandler(db) {
       WHERE i.po_id = ANY(?::bigint[]) ORDER BY i.id`, [orders.map((o) => o.id)]);
     return orders.map((o) => ({ ...o, items: items.filter((i) => i.po_id === o.id) }));
   });
-  route('POST', '/api/admin/purchase-orders/:id/receive', ['admin'], ({ params, user }) => db.tx(async (t) => {
+  route('POST', '/api/admin/purchase-orders/:id/receive', ['admin'], ({ params, user }) => txu(user, async (t) => {
     const o = await t.one('SELECT * FROM purchase_orders WHERE id=? FOR UPDATE', [idArg(params.id)]);
     if (!o) throw new HttpError(404, 'Buyurtma topilmadi');
     if (o.status !== 'ordered') throw new HttpError(409, 'Buyurtma allaqachon yopilgan');
@@ -405,16 +466,16 @@ export function createHandler(db) {
 
   // ---------- Admin: foydalanuvchilar ----------
   route('GET', '/api/admin/users', ['admin'], () => db.q('SELECT id,username,name,role,active FROM users ORDER BY id'));
-  route('POST', '/api/admin/users', ['admin'], async ({ body }) => {
+  route('POST', '/api/admin/users', ['admin'], async ({ body, user }) => {
     const role = body.role === 'admin' ? 'admin' : 'seller';
     const pw = str(body.password, 'Parol', 100);
     if (pw.length < 6) throw bad('Parol kamida 6 belgi');
     try {
-      return await db.one('INSERT INTO users(username,name,role,password_hash) VALUES(?,?,?,?) RETURNING id',
-        [str(body.username, 'Login', 40), str(body.name, 'Ism', 80), role, hashPassword(pw)]);
+      return await txu(user, (t) => t.one('INSERT INTO users(username,name,role,password_hash) VALUES(?,?,?,?) RETURNING id',
+        [str(body.username, 'Login', 40), str(body.name, 'Ism', 80), role, hashPassword(pw)]));
     } catch (e) { if (isUnique(e)) throw bad('Bunday login band'); throw e; }
   });
-  route('PUT', '/api/admin/users/:id', ['admin'], async ({ params, body, user }) => {
+  route('PUT', '/api/admin/users/:id', ['admin'], ({ params, body, user }) => txu(user, async (db) => {
     const id = idArg(params.id);
     if (id === user.id && body.active === false) throw bad('O\'zingizni o\'chira olmaysiz');
     if (body.password) {
@@ -422,11 +483,16 @@ export function createHandler(db) {
       await db.run('UPDATE users SET password_hash=? WHERE id=?', [hashPassword(String(body.password)), id]);
     }
     if (typeof body.active === 'boolean') {
+      if (!body.active) {
+        const left = await db.one("SELECT COUNT(*)::int c FROM users WHERE role='admin' AND active AND id<>?", [id]);
+        const target = await db.one('SELECT role FROM users WHERE id=?', [id]);
+        if (target?.role === 'admin' && !left.c) throw bad('Oxirgi aktiv adminni noaktiv qilib bo\'lmaydi');
+      }
       await db.run('UPDATE users SET active=? WHERE id=?', [body.active, id]);
-      if (!body.active) await db.run('DELETE FROM sessions WHERE user_id=?', [id]);
+      if (!body.active) await db.run('UPDATE sessions SET revoked=TRUE WHERE user_id=?', [id]);
     }
     return { ok: true };
-  });
+  }));
 
   // ---------- HTTP ----------
   const cookie = (req) => Object.fromEntries((req.headers.cookie || '').split(';').map((c) => c.trim().split('=')).filter((p) => p[0]));
@@ -451,7 +517,7 @@ export function createHandler(db) {
     const t = cookie(req).sid;
     if (!t) return null;
     return db.one(`SELECT u.id,u.name,u.role FROM sessions s JOIN users u ON u.id=s.user_id
-      WHERE s.token=? AND u.active AND s.created_at > now() - interval '12 hours'`, [t]);
+      WHERE s.token=? AND NOT s.revoked AND u.active AND s.created_at > now() - interval '12 hours'`, [t]);
   };
   const clientIp = (req) => String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown').split(',')[0].trim();
 

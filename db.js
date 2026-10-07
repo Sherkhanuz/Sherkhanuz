@@ -114,6 +114,77 @@ CREATE INDEX IF NOT EXISTS idx_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_items_prod ON sale_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_items_orig ON sale_items(orig_item_id);
 CREATE INDEX IF NOT EXISTS idx_receipt_items_prod ON receipt_items(product_id);
+
+-- Holat (aktiv/noaktiv): ma'lumot o'chirilmaydi, faqat noaktiv qilinadi
+ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE;
+-- Sessiya o'chirilmaydi, bekor qilinadi
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS revoked BOOLEAN NOT NULL DEFAULT FALSE;
+-- Kirimni tuzatish: storno hujjati (kind='reversal'), asl hujjatga bog'langan
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'receipt' CHECK(kind IN ('receipt','reversal'));
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ref_receipt_id BIGINT REFERENCES receipts(id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_receipt_reversal ON receipts(ref_receipt_id) WHERE ref_receipt_id IS NOT NULL;
+
+-- O'zgarishlar tarixi (SAP: CDHDR/CDPOS): kim, qachon, qaysi maydonni, eski -> yangi
+CREATE TABLE IF NOT EXISTS change_log(
+  id BIGSERIAL PRIMARY KEY, table_name TEXT NOT NULL, record_id BIGINT NOT NULL,
+  action CHAR(1) NOT NULL CHECK(action IN ('I','U')), field TEXT, old_value TEXT, new_value TEXT,
+  user_id BIGINT, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS idx_change_log_rec ON change_log(table_name, record_id);
+`;
+
+// ---- Ma'lumot yaxlitligi (SAP standarti) ----
+// 1) Hech qaysi jadvaldan qator o'chirib bo'lmaydi (DELETE/TRUNCATE) — DB darajasida.
+// 2) Hujjatlar (sotuv, kirim, harakatlar, to'lovlar...) yozilgach o'zgarmaydi — faqat storno/qaytarish hujjati bilan tuzatiladi.
+// 3) Asosiy ma'lumotlar (mahsulot, mijoz, yetkazuvchi, foydalanuvchi) o'zgarishi change_log ga yoziladi.
+const ALL_TABLES = ['users', 'sessions', 'login_attempts', 'products', 'suppliers', 'customers', 'debt_payments', 'sales', 'sale_items',
+  'receipts', 'receipt_items', 'purchase_orders', 'po_items', 'stock_moves', 'change_log'];
+const DOCUMENTS = ['debt_payments', 'sales', 'sale_items', 'receipts', 'receipt_items', 'po_items', 'stock_moves', 'change_log'];
+const MASTER = ['users', 'products', 'suppliers', 'customers', 'purchase_orders'];
+
+export const INTEGRITY = `
+CREATE OR REPLACE FUNCTION forbid_delete() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'Ma''lumotni o''chirib bo''lmaydi (% jadvali): noaktiv holatga o''tkazing', TG_TABLE_NAME USING ERRCODE = 'integrity_constraint_violation'; END
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION forbid_update() RETURNS trigger AS $$
+BEGIN RAISE EXCEPTION 'Hujjat o''zgartirilmaydi (% jadvali): storno/qaytarish hujjati yarating', TG_TABLE_NAME USING ERRCODE = 'integrity_constraint_violation'; END
+$$ LANGUAGE plpgsql;
+
+-- Buyurtma: faqat 'ordered' -> 'received'/'cancelled' (status va yopilish vaqti); qolgan maydonlar o'zgarmaydi
+CREATE OR REPLACE FUNCTION guard_purchase_order() RETURNS trigger AS $$
+BEGIN
+  IF OLD.status <> 'ordered' THEN RAISE EXCEPTION 'Yopilgan buyurtma o''zgartirilmaydi' USING ERRCODE = 'integrity_constraint_violation'; END IF;
+  IF (to_jsonb(NEW) - 'status' - 'closed_at') IS DISTINCT FROM (to_jsonb(OLD) - 'status' - 'closed_at') THEN
+    RAISE EXCEPTION 'Buyurtma tarkibi o''zgartirilmaydi' USING ERRCODE = 'integrity_constraint_violation'; END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION log_changes() RETURNS trigger AS $$
+DECLARE k text; o jsonb; n jsonb; uid bigint;
+BEGIN
+  uid := NULLIF(current_setting('app.user_id', true), '')::bigint;
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO change_log(table_name, record_id, action, user_id) VALUES (TG_TABLE_NAME, NEW.id, 'I', uid);
+    RETURN NEW;
+  END IF;
+  o := to_jsonb(OLD); n := to_jsonb(NEW);
+  FOR k IN SELECT jsonb_object_keys(n) LOOP
+    CONTINUE WHEN k IN ('stock', 'balance'); -- bular harakatlar daftaridan (stock_moves, sales) kelib chiqadi
+    IF o->k IS DISTINCT FROM n->k THEN
+      INSERT INTO change_log(table_name, record_id, action, field, old_value, new_value, user_id)
+      VALUES (TG_TABLE_NAME, NEW.id, 'U', k, CASE WHEN k = 'password_hash' THEN '***' ELSE o->>k END,
+              CASE WHEN k = 'password_hash' THEN '***' ELSE n->>k END, uid);
+    END IF;
+  END LOOP;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+${ALL_TABLES.map((t) => `CREATE OR REPLACE TRIGGER trg_nodelete BEFORE DELETE ON ${t} FOR EACH STATEMENT EXECUTE FUNCTION forbid_delete();
+CREATE OR REPLACE TRIGGER trg_notruncate BEFORE TRUNCATE ON ${t} FOR EACH STATEMENT EXECUTE FUNCTION forbid_delete();`).join('\n')}
+${DOCUMENTS.map((t) => `CREATE OR REPLACE TRIGGER trg_immutable BEFORE UPDATE ON ${t} FOR EACH ROW EXECUTE FUNCTION forbid_update();`).join('\n')}
+CREATE OR REPLACE TRIGGER trg_po_guard BEFORE UPDATE ON purchase_orders FOR EACH ROW EXECUTE FUNCTION guard_purchase_order();
+${MASTER.map((t) => `CREATE OR REPLACE TRIGGER trg_audit AFTER INSERT OR UPDATE ON ${t} FOR EACH ROW EXECUTE FUNCTION log_changes();`).join('\n')}
 `;
 
 export function hashPassword(pw) {
@@ -127,7 +198,20 @@ export function verifyPassword(pw, stored) {
 
 const isProd = () => !!process.env.VERCEL || process.env.NODE_ENV === 'production';
 
-export async function migrate(db) { await db.exec(SCHEMA); }
+// Sxema versiyasi: SCHEMA/INTEGRITY o'zgarganda oshiring. Bir vaqtda bir nechta serverless nusxa ishga tushsa ham
+// migratsiya advisory lock ostida faqat bir marta bajariladi (tranzaksion DDL).
+export const SCHEMA_VERSION = 2;
+export async function migrate(db) {
+  await db.tx(async (t) => {
+    await t.q('SELECT pg_advisory_xact_lock(727001)');
+    await t.exec('CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value INT NOT NULL)');
+    const cur = (await t.one("SELECT value FROM schema_meta WHERE key='version'"))?.value ?? 0;
+    if (cur >= SCHEMA_VERSION) return;
+    await t.exec(SCHEMA);
+    await t.exec(INTEGRITY);
+    await t.run("INSERT INTO schema_meta(key,value) VALUES('version',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", [SCHEMA_VERSION]);
+  });
+}
 
 // Birinchi admin/sotuvchi. Ishlab chiqarishda parol env orqali majburiy (standart parol yo'q).
 export async function ensureDefaultUsers(db) {

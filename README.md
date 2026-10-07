@@ -36,12 +36,28 @@ npm test
 
 Sxemani oldindan yaratish: `DATABASE_URL=... npm run migrate`.
 
+## Ma'lumot yaxlitligi (SAP tamoyillari)
+Ma'lumot **hech qachon o'chirilmaydi** — faqat **aktiv / noaktiv** holatga o'tadi. Bu qoidalar ilovada emas, **bazaning o'zida** (trigger) majburlanadi, shuning uchun xato yoki hujum ham ularni buzolmaydi.
+
+| Qoida | Qanday |
+|---|---|
+| O'chirish taqiqlangan | Barcha jadvallarda `DELETE` va `TRUNCATE` bazada rad etiladi (sessiya va login urinishlari ham: bekor qilinadi/nolga tushiriladi, o'chirilmaydi) |
+| Asosiy ma'lumotlar: aktiv/noaktiv | Mahsulot, mijoz, yetkazib beruvchi, foydalanuvchi. Noaktiv yangi sotuv/kirim/buyurtmada ishlatilmaydi, tarixi saqlanadi, istalgan payt qayta faollashtiriladi |
+| Noaktiv qilish tekshiruvlari | Mahsulot: qoldiq 0 va ochiq buyurtma yo'q · Mijoz: qarz 0 · Yetkazuvchi: ochiq buyurtma yo'q · Oxirgi admin noaktiv bo'lmaydi |
+| Hujjatlar o'zgarmas | Sotuv, kirim, harakatlar, to'lovlar, buyurtma qatorlari yozilgach `UPDATE` rad etiladi. Buyurtmada faqat holat (`ordered` → `received`/`cancelled`) o'zgaradi |
+| Tuzatish — storno | Qaytarish (sotuv uchun) va kirim stornosi (admin) — asl hujjatga bog'langan **teskari hujjat**; ikki marta storno qilib bo'lmaydi |
+| O'zgarishlar tarixi | `change_log`: kim, qachon, qaysi maydon, eski → yangi (narx, tannarx, holat, ... parollar `***`). Admin → **Tarix** |
+| Qoldiq va qarz | `stock`/`balance` — hisoblangan qoldiq; asosi o'zgarmas daftar (`stock_moves`, `sales`, `debt_payments`) |
+
+Qo'shimcha himoya (tavsiya): ishlab chiqarishda ilova uchun alohida DB roli oching va unga `DELETE`/`TRUNCATE`/`TRIGGER` huquqini bermang — trigger'ni o'chirish ham mumkin bo'lmaydi.
+Cheklov: hujjat raqamlari ketma-ket (gapless) kafolatlanmaydi (bekor qilingan tranzaksiya raqam "teshigi" qoldirishi mumkin).
+
 ## Arxitektura
 ```
 public/            statik UI (vanilla JS) — Vercel CDN
 api/index.js       yagona serverless funksiya (vercel.json: /api/* -> shu yerga)
 app.js             REST API (marshrutlar, rol tekshiruvi, hisob-kitob)
-db.js              Postgres qatlami: pg (Neon) yoki PGlite (lokal), sxema, parol xeshi
+db.js              Postgres qatlami: pg (Neon) yoki PGlite (lokal), sxema + yaxlitlik triggerlari, versiyali migratsiya (advisory lock)
 seed.js, migrate.js, test/
 ```
 - Soatlik/kunlik tahlil `TZ_NAME` (standart `Asia/Tashkent`) bo'yicha hisoblanadi.

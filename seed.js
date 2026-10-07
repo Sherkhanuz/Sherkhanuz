@@ -55,10 +55,11 @@ await db.tx(async (t) => {
   // Boshlang'ich kirim: yetkazib beruvchi bo'yicha
   for (let s = 0; s < 3; s++) {
     const mine = P.map((p, i) => [p, i]).filter(([p]) => p[7] === s);
-    const [rid] = await bulk(t, 'receipts', ['user_id', 'supplier_id', 'note', 'created_at'], [[seller, supIds[s], 'Boshlang\'ich qoldiq', day0]], true);
-    const items = mine.map(([p, i]) => { const q = Math.ceil(p[6] * 32 + 5); stock[i] += q; return [rid, ids[i], q, p[4]]; });
+    const q = mine.map(([p]) => Math.ceil(p[6] * 32 + 5));
+    const total = mine.reduce((a, [p], k) => a + q[k] * p[4], 0); // hujjat o'zgarmas: jami oldindan hisoblanadi
+    const [rid] = await bulk(t, 'receipts', ['user_id', 'supplier_id', 'note', 'total', 'created_at'], [[seller, supIds[s], 'Boshlang\'ich qoldiq', total, day0]], true);
+    const items = mine.map(([p, i], k) => { stock[i] += q[k]; return [rid, ids[i], q[k], p[4]]; });
     await bulk(t, 'receipt_items', ['receipt_id', 'product_id', 'qty', 'cost'], items);
-    await t.run('UPDATE receipts SET total=(SELECT SUM(qty*cost) FROM receipt_items WHERE receipt_id=?) WHERE id=?', [rid, rid]);
     await bulk(t, 'stock_moves', ['product_id', 'type', 'qty', 'ref_id', 'user_id', 'created_at'], items.map((x) => [x[1], 'receipt', x[2], rid, seller, day0]));
   }
 
