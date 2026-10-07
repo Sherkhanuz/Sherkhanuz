@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: mini-erp
+    runtime: docker
+    plan: starter        # doimiy disk bepul rejada mavjud emas
+    healthCheckPath: /
+    envVars:
+      - key: ADMIN_PASSWORD
+        sync: false      # Render panelida o'zingiz kiritasiz
+      - key: SELLER_PASSWORD
+        sync: false
+      - key: DB_FILE
+        value: /data/erp.db
+    disk:
+      name: erp-data
+      mountPath: /data
+      sizeGB: 1
