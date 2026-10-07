@@ -34,3 +34,5 @@ button.btn:disabled{opacity:.5;cursor:default}
 svg.chart text{fill:var(--mute);font-size:10px}svg.chart .bar{fill:var(--pri)}svg.chart .bar:hover{opacity:.7}
 .pick{max-height:300px;overflow:auto}.pick button{display:flex;justify-content:space-between;width:100%;text-align:left;padding:8px;border:0;border-bottom:1px solid var(--line);background:none;color:var(--ink);font:inherit;cursor:pointer}
 .pick button:hover{background:var(--bg)}
+#print{display:none}
+@media print{body>*:not(#print){display:none!important}#print{display:block;width:72mm;font:12px/1.4 monospace;color:#000;background:#fff}#print .rl{display:flex;justify-content:space-between;gap:8px}}

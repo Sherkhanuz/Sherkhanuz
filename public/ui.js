@@ -3,7 +3,9 @@ const $ = (s, el = document) => el.querySelector(s);
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
-    if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    // 'change' blur paytida, element olib tashlanayotganda ham ishga tushadi — qayta chizish xatosi bo'lmasin deb keyinga suriladi
+    if (k === 'onchange') el.addEventListener('change', (e) => setTimeout(() => v(e), 0));
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else if (k === 'class') el.className = v;
     else if (v === true) el.setAttribute(k, '');
     else if (v !== false && v != null) el.setAttribute(k, v);
@@ -16,7 +18,7 @@ const qf = (n) => String(Math.round(Number(n) * 1000) / 1000);
 const money = (n) => fmt(n) + " so'm";
 const today = () => new Date(Date.now() + 5 * 3600e3).toISOString().slice(0, 10);
 const addDays = (d, n) => new Date(Date.parse(d + 'T00:00:00Z') + n * 864e5).toISOString().slice(0, 10);
-const hhmm = (s) => new Date(s.replace(' ', 'T') + 'Z').toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' });
+const hhmm = (s) => new Date(s).toLocaleString('uz-UZ', { timeZone: 'Asia/Tashkent', hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' });
 
 async function api(method, path, body) {
   const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'erp' }, body: body ? JSON.stringify(body) : undefined });
@@ -72,41 +74,80 @@ function loginView() {
 }
 
 // ---------- Sotuvchi: Sotuv ----------
+function printReceipt(r) {
+  let el = $('#print');
+  if (!el) { el = h('div', { id: 'print' }); document.body.append(el); }
+  el.replaceChildren(...[h('h3', {}, 'Mini ERP'), h('div', {}, `Chek №${r.id} · ${hhmm(new Date().toISOString())}`), h('hr'),
+    ...r.lines.map((l) => h('div', { class: 'rl' }, h('span', {}, `${l.name} ×${qf(l.qty)}`), h('span', {}, fmt(l.total)))), h('hr'),
+    h('div', { class: 'rl' }, h('span', {}, 'Jami'), h('span', {}, fmt(r.subtotal))),
+    r.discount ? h('div', { class: 'rl' }, h('span', {}, 'Chegirma'), h('span', {}, '−' + fmt(r.discount))) : null,
+    h('div', { class: 'rl' }, h('b', {}, "To'lash kerak"), h('b', {}, fmt(r.total))),
+    r.debt ? h('div', { class: 'rl' }, h('span', {}, 'Nasiya'), h('span', {}, fmt(r.debt))) : null, h('p', {}, 'Xaridingiz uchun rahmat!')].filter(Boolean));
+  window.print();
+}
+
 async function sellView() {
-  const products = await get('/api/products');
+  const [products, customers] = await Promise.all([get('/api/products'), get('/api/customers')]);
   const cart = new Map(); // id -> qty
-  const box = msgBox(), list = h('div', { class: 'pick' }), cartEl = h('div'), totalEl = h('div', { class: 'total' }, '0 so\'m');
-  const q = h('input', { placeholder: 'Mahsulot nomi yoki SKU...', style: 'flex:1' });
+  const box = msgBox(), list = h('div', { class: 'pick' }), cartEl = h('div'), sumEl = h('div'), lastEl = h('div');
+  const q = h('input', { placeholder: 'Nomi yoki shtrixkod (skaner + Enter)...', style: 'flex:1', autofocus: true });
   const method = h('select', {}, h('option', { value: 'cash' }, 'Naqd'), h('option', { value: 'card' }, 'Karta'), h('option', { value: 'transfer' }, "O'tkazma"));
+  const cust = h('select', { onchange: () => drawCart() }, h('option', { value: '' }, '— mijoz yo\'q —'), customers.map((c) => h('option', { value: c.id }, c.name)));
+  const dType = h('select', { onchange: () => drawCart() }, h('option', { value: 'amount' }, "so'm"), h('option', { value: 'percent' }, '%'));
+  const dVal = h('input', { type: 'number', min: 0, step: 'any', value: 0, oninput: () => drawCart() });
+  const paid = h('input', { type: 'number', min: 0, placeholder: "to'langan (bo'sh = to'liq)", style: 'width:170px', oninput: () => drawCart() });
   const byId = new Map(products.map((p) => [p.id, p]));
-  const drawList = () => {
-    const s = q.value.toLowerCase();
-    list.replaceChildren(...products.filter((p) => !s || p.name.toLowerCase().includes(s) || (p.sku || '').toLowerCase().includes(s)).slice(0, 60).map((p) =>
-      h('button', { disabled: p.stock <= 0, onclick: () => { cart.set(p.id, Math.min((cart.get(p.id) || 0) + 1, p.stock)); drawCart(); } },
-        h('span', {}, p.name), h('span', { class: 'mute' }, `${money(p.price)} · ${qf(p.stock)} ${p.unit}`))));
+  const addToCart = (p) => { if (p.stock > 0) { cart.set(p.id, Math.min((cart.get(p.id) || 0) + 1, p.stock)); drawCart(); } };
+  const matches = () => { const s = q.value.trim().toLowerCase(); return products.filter((p) => !s || p.name.toLowerCase().includes(s) || (p.sku || '').toLowerCase().includes(s)); };
+  const drawList = () => list.replaceChildren(...matches().slice(0, 60).map((p) =>
+    h('button', { disabled: p.stock <= 0, onclick: () => addToCart(p) }, h('span', {}, p.name), h('span', { class: 'mute' }, `${money(p.price)} · ${qf(p.stock)} ${p.unit}`))));
+  q.addEventListener('keydown', (e) => { // skaner SKU ni yozib Enter bosadi
+    if (e.key !== 'Enter') return;
+    const code = q.value.trim(); const exact = products.find((p) => p.sku && p.sku === code);
+    const hit = exact || (matches().length === 1 ? matches()[0] : null);
+    if (hit) { addToCart(hit); q.value = ''; drawList(); } else flash(box, 'Mahsulot topilmadi: ' + code);
+  });
+  const calc = () => {
+    let subtotal = 0; const ls = [];
+    for (const [id, n] of cart) { const p = byId.get(id); const total = Math.round(p.price * n); subtotal += total; ls.push({ id, name: p.name, qty: n, total }); }
+    const dv = Number(dVal.value) || 0;
+    const discount = Math.min(subtotal, dType.value === 'percent' ? Math.round(subtotal * Math.min(dv, 100) / 100) : Math.round(dv));
+    const total = subtotal - discount;
+    const pd = paid.value === '' ? total : Math.min(Math.round(Number(paid.value) || 0), total);
+    return { ls, subtotal, discount, total, pd };
   };
   const drawCart = () => {
-    let total = 0;
+    const c = calc();
     cartEl.replaceChildren(cart.size ? table(['Mahsulot', 'Miqdor', 'Summa', ''], [...cart].map(([id, n]) => {
-      const p = byId.get(id); total += Math.round(p.price * n);
+      const p = byId.get(id);
       const inp = h('input', { type: 'number', min: 0, step: 'any', value: n, onchange: () => { const v = Number(inp.value); v > 0 ? cart.set(id, Math.min(v, p.stock)) : cart.delete(id); drawCart(); } });
       return [p.name, inp, money(p.price * n), h('button', { class: 'btn sec', onclick: () => { cart.delete(id); drawCart(); } }, '✕')];
     }), [2]) : h('p', { class: 'mute' }, "Savat bo'sh"));
-    totalEl.textContent = money(total);
+    sumEl.replaceChildren(...[
+      c.discount ? h('div', { class: 'mute' }, `Jami: ${money(c.subtotal)} − chegirma ${money(c.discount)}`) : null,
+      c.pd < c.total ? h('div', { class: 'tag low' }, `Nasiya: ${money(c.total - c.pd)}${cust.value ? '' : ' — mijozni tanlang'}`) : null,
+      h('div', { class: 'total' }, money(c.total))].filter(Boolean));
   };
   const sell = async () => {
+    const c = calc();
     try {
-      const r = await post('/api/sales', { method: method.value, items: [...cart].map(([product_id, qty]) => ({ product_id, qty })) });
+      const r = await post('/api/sales', { method: method.value, customer_id: cust.value || null, discount: Number(dVal.value) || 0, discount_type: dType.value,
+        paid: paid.value === '' ? null : Number(paid.value), items: [...cart].map(([product_id, qty]) => ({ product_id, qty })) });
       flash(box, `Sotuv #${r.id} saqlandi: ${money(r.total)}`, 'ok');
       for (const [id, n] of cart) byId.get(id).stock -= n;
-      cart.clear(); drawCart(); drawList();
+      const receipt = { ...r, lines: c.ls };
+      lastEl.replaceChildren(h('button', { class: 'btn sec', onclick: () => printReceipt(receipt) }, '🖨 Chekni chop etish'));
+      cart.clear(); dVal.value = 0; paid.value = ''; drawCart(); drawList(); q.focus();
+      if (cust.value) get('/api/customers').catch(() => {});
     } catch (e) { flash(box, e.message); }
   };
   q.addEventListener('input', drawList); drawList(); drawCart();
   return h('div', { class: 'cols' },
     h('div', { class: 'card' }, h('h3', {}, 'Mahsulot tanlash'), h('div', { class: 'row' }, q), list),
-    h('div', { class: 'card' }, h('h3', {}, 'Savat'), box, cartEl, h('div', { class: 'row', style: 'justify-content:space-between;margin-top:10px' }, totalEl, method),
-      h('button', { class: 'btn', style: 'width:100%', onclick: sell }, 'Sotish')));
+    h('div', { class: 'card' }, h('h3', {}, 'Savat'), box, cartEl,
+      h('div', { class: 'row' }, h('span', { class: 'mute' }, 'Chegirma:'), dVal, dType, cust),
+      h('div', { class: 'row' }, h('span', { class: 'mute' }, "To'lov:"), paid, method), sumEl,
+      h('button', { class: 'btn', style: 'width:100%', onclick: sell }, 'Sotish'), h('div', { style: 'margin-top:8px' }, lastEl)));
 }
 
 // ---------- Kirim (sotuvchi va admin) ----------
@@ -182,7 +223,7 @@ async function mySalesView() {
   const rows = await get('/api/sales?date=' + today());
   const sum = rows.reduce((a, r) => a + r.total, 0);
   return h('div', { class: 'card' }, h('h3', {}, `Bugungi sotuvlarim: ${rows.length} ta, ${money(sum)}`),
-    rows.length ? table(['№', 'Vaqt', 'Mahsulotlar', 'To\'lov', 'Summa'], rows.map((r) => [r.id, hhmm(r.created_at), r.items, { cash: 'Naqd', card: 'Karta', transfer: "O'tkazma" }[r.method], money(r.total)]), [4]) : h('p', { class: 'mute' }, 'Hali sotuv yo\'q'));
+    rows.length ? table(['№', 'Vaqt', 'Mahsulotlar', 'To\'lov', 'Summa'], rows.map((r) => [r.id, hhmm(r.created_at), r.kind === 'return' ? h('span', { class: 'tag low' }, 'Qaytarish: ' + r.items) : r.items, { cash: 'Naqd', card: 'Karta', transfer: "O'tkazma" }[r.method], money(r.total)]), [4]) : h('p', { class: 'mute' }, 'Hali sotuv yo\'q'));
 }
 
 // ---------- Admin: dashboard ----------
@@ -202,7 +243,8 @@ async function dashboardView() {
     const peak = hourly.hours.reduce((a, b) => (b.revenue > a.revenue ? b : a));
     wrap.replaceChildren(
       h('div', { class: 'grid' }, kpi('Tushum', money(t.revenue), delta(t.revenue, y.revenue)), kpi('Foyda', money(t.profit), delta(t.profit, y.profit)),
-        kpi('Cheklar', fmt(t.orders), delta(t.orders, y.orders)), kpi('Ombor qiymati (tannarx)', money(inv.cost_value), `${inv.products} ta mahsulot, ${inv.low || 0} tasi kam`)),
+        kpi('Cheklar', fmt(t.orders), delta(t.orders, y.orders)), kpi('Ombor qiymati (tannarx)', money(inv.cost_value), `${inv.products} ta mahsulot, ${inv.low || 0} tasi kam`),
+        kpi('Nasiya (qarzlar)', money(sum.debt.total), `${sum.debt.customers} ta mijoz`)),
       h('div', { class: 'card' }, h('h3', {}, `Soatma-soat tushum — ${date}${pid ? ' (tanlangan mahsulot)' : ''}`), barChart(hourly.hours, { label: (x) => String(x.hour).padStart(2, '0'), value: (x) => x.revenue }),
         h('p', { class: 'mute' }, peak.revenue ? `Eng gavjum soat: ${String(peak.hour).padStart(2, '0')}:00 (${money(peak.revenue)})` : 'Bu kunda sotuv yo\'q')),
       h('div', { class: 'card' }, h('h3', {}, `Kunma-kun tushum — oxirgi ${days} kun`), barChart(daily.days, { label: (x) => x.day.slice(5), value: (x) => x.revenue })),
@@ -273,7 +315,7 @@ async function salesHistoryView() {
   let date = today(); const out = h('div');
   const load = async () => {
     const rows = await get('/api/sales?date=' + date);
-    out.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Sotuvchi', 'Mahsulotlar', 'Summa'], rows.map((r) => [r.id, hhmm(r.created_at), r.seller, r.items, money(r.total)]), [4]) : h('p', { class: 'mute' }, 'Sotuv yo\'q'));
+    out.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Sotuvchi', 'Mahsulotlar', 'Summa'], rows.map((r) => [r.id, hhmm(r.created_at), r.seller, r.kind === 'return' ? h('span', { class: 'tag low' }, 'Qaytarish: ' + r.items) : [r.items, r.customer ? ' · ' + r.customer : '', r.discount ? ` · chegirma ${fmt(r.discount)}` : ''].join(''), money(r.total)]), [4]) : h('p', { class: 'mute' }, 'Sotuv yo\'q'));
   };
   await load();
   return h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Sotuvlar tarixi'), h('input', { type: 'date', value: date, onchange: (e) => { date = e.target.value; load(); } })), out);
@@ -295,10 +337,54 @@ async function usersView() {
     h('div', { class: 'card' }, out));
 }
 
+// ---------- Qaytarish ----------
+async function returnsView() {
+  let date = today(); const list = h('div'), form = h('div'), box = msgBox();
+  const open = async (id) => {
+    const s = await get('/api/sales/' + id);
+    const qty = new Map(); const refund = h('select', {}, h('option', { value: 'cash' }, 'Naqd qaytariladi'), s.customer_id ? h('option', { value: 'debt' }, 'Mijoz qarziga o\'tkaziladi') : null);
+    form.replaceChildren(h('div', { class: 'card' }, h('h3', {}, `Sotuv #${s.id} — ${hhmm(s.created_at)}${s.customer ? ' · ' + s.customer : ''}`),
+      table(['Mahsulot', 'Sotilgan', 'Qaytarish mumkin', 'Qaytarish'], s.items.map((i) => [i.name, `${qf(i.qty)} ${i.unit}`, qf(i.returnable),
+        h('input', { type: 'number', min: 0, max: i.returnable, step: 'any', value: 0, disabled: i.returnable <= 0, oninput: (e) => qty.set(i.id, Number(e.target.value)) })]), [1, 2]),
+      h('div', { class: 'row', style: 'margin-top:10px' }, refund, h('button', { class: 'btn', onclick: async () => {
+        try {
+          const r = await post('/api/returns', { sale_id: s.id, refund: refund.value, items: [...qty].map(([sale_item_id, q]) => ({ sale_item_id, qty: q })) });
+          flash(box, `Qaytarish #${r.id}: ${money(r.total)} (qarzga: ${money(r.to_debt)}, naqd: ${money(r.cash_refund)})`, 'ok'); form.replaceChildren(); load();
+        } catch (e) { flash(box, e.message); }
+      } }, 'Qaytarishni tasdiqlash'), h('button', { class: 'btn sec', onclick: () => form.replaceChildren() }, 'Bekor'))));
+  };
+  const load = async () => {
+    const rows = (await get('/api/sales?date=' + date)).filter((r) => r.kind === 'sale');
+    list.replaceChildren(rows.length ? table(['№', 'Vaqt', 'Mahsulotlar', 'Summa', ''], rows.map((r) => [r.id, hhmm(r.created_at), r.items, money(r.total),
+      h('button', { class: 'btn sec', onclick: () => open(r.id).catch((e) => flash(box, e.message)) }, 'Qaytarish')]), [3]) : h('p', { class: 'mute' }, 'Sotuv yo\'q'));
+  };
+  await load();
+  return h('div', {}, box, form, h('div', { class: 'card' }, h('div', { class: 'row' }, h('b', {}, 'Qaytariladigan sotuvni tanlang'),
+    h('input', { type: 'date', value: date, max: today(), onchange: (e) => { date = e.target.value; load(); } })), list));
+}
+
+// ---------- Mijozlar va nasiya ----------
+async function customersView() {
+  const box = msgBox(), out = h('div'); const f = { name: '', phone: '' };
+  const load = async () => {
+    const cs = await get('/api/customers');
+    out.replaceChildren(cs.length ? table(['Mijoz', 'Telefon', 'Qarz', ''], cs.map((c) => [c.name, c.phone, c.balance ? h('b', {}, money(c.balance)) : '—',
+      c.balance ? h('button', { class: 'btn sec', onclick: async () => {
+        const v = prompt(`${c.name}: to'lov summasi (qarz ${fmt(c.balance)})`, c.balance); if (!v) return;
+        try { await post(`/api/customers/${c.id}/payments`, { amount: Number(v) }); flash(box, "To'lov qabul qilindi", 'ok'); load(); } catch (e) { flash(box, e.message); }
+      } }, "To'lov qabul qilish") : '']), [2]) : h('p', { class: 'mute' }, 'Mijozlar yo\'q'));
+  };
+  const inp = (k, ph) => h('input', { placeholder: ph, oninput: (e) => { f[k] = e.target.value; } });
+  await load();
+  return h('div', {}, box, h('div', { class: 'card' }, h('h3', {}, 'Yangi mijoz'), h('div', { class: 'row' }, inp('name', 'Ism'), inp('phone', 'Telefon'),
+    h('button', { class: 'btn', onclick: async () => { try { await post('/api/customers', f); flash(box, "Qo'shildi", 'ok'); load(); } catch (e) { flash(box, e.message); } } }, "Qo'shish"))),
+    h('div', { class: 'card' }, h('h3', {}, 'Nasiya (qarzdorlar)'), out));
+}
+
 const TABS = {
-  seller: [['sell', 'Sotuv', sellView], ['receipt', 'Kirim', receiptView], ['stock', 'Ombor', stockView], ['mine', 'Sotuvlarim', mySalesView]],
+  seller: [['sell', 'Sotuv', sellView], ['receipt', 'Kirim', receiptView], ['stock', 'Ombor', stockView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['mine', 'Sotuvlarim', mySalesView]],
   admin: [['dash', 'Tahlil', dashboardView], ['stock', 'Ombor', stockView], ['offers', 'Xarid takliflari', offersView], ['orders', 'Buyurtmalar', ordersView],
-    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['users', 'Foydalanuvchilar', usersView]],
+    ['receipt', 'Kirim', receiptView], ['sales', 'Sotuvlar', salesHistoryView], ['returns', 'Qaytarish', returnsView], ['cust', 'Mijozlar', customersView], ['users', 'Foydalanuvchilar', usersView]],
 };
 
 async function render() {

@@ -1,0 +1,13 @@
+{
+  "outputDirectory": "public",
+  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/index.js" }],
+  "functions": { "api/index.js": { "maxDuration": 15 } },
+  "headers": [{
+    "source": "/(.*)",
+    "headers": [
+      { "key": "Content-Security-Policy", "value": "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'" },
+      { "key": "X-Content-Type-Options", "value": "nosniff" },
+      { "key": "Strict-Transport-Security", "value": "max-age=31536000" }
+    ]
+  }]
+}

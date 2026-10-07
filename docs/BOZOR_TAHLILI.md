@@ -37,7 +37,7 @@
 
 ## 4. Bizning loyiha qayerda turadi
 
-| Imkoniyat | Basic yechimlar | Pro yechimlar | **Bu loyiha (v0.1)** |
+| Imkoniyat | Basic yechimlar | Pro yechimlar | **Bu loyiha (v0.2)** |
 |---|---|---|---|
 | Sotuvchi: sotuv | ✅ | ✅ | ✅ |
 | Sotuvchi: kirim | ✅ | ✅ | ✅ |
@@ -47,20 +47,21 @@
 | Mahsulot bo'yicha tahlil | ⚠️ | ✅ | ✅ (top, foyda, mahsulot filtri) |
 | Kam qolgan mahsulotga xarid taklifi | ❌ (faqat ogohlantirish) | ✅ | ✅ sotuv tezligiga asoslangan, yetkazuvchi bo'yicha guruhlangan |
 | Buyurtma → qabul → avto kirim | ❌ | ✅ | ✅ |
-| Shtrixkod / printer | ✅ | ✅ | ❌ |
+| Shtrixkod / chek printer | ✅ | ✅ | ✅ (klaviatura-skaner + brauzer orqali chop etish) |
 | Ko'p filial / ombor | ❌ | ✅ | ❌ |
 | Soliq/fiskal integratsiya | ✅ (mahalliy) | ✅ | ❌ |
 | Offline rejim | ⚠️ | ✅ | ❌ |
-| Qaytarish, chegirma, nasiya | ⚠️ | ✅ | ❌ |
+| Qaytarish, chegirma, nasiya | ⚠️ | ✅ | ✅ |
 
 **Xulosa.** Basic yechimlar arzon, lekin tahlil va xarid avtomatlashtirishi zaif; Pro yechimlar (Odoo, 1С, Smartup) murakkab va qimmat. Bu loyiha oradagi nuqtani nishonga oladi: kassa va ombor oddiy, tahlil va xarid taklifi Pro darajada.
 
 ## 5. Keyingi bosqichlar (ustuvorlik bo'yicha)
 
-1. Qaytarish, chegirma, nasiya (qarz).
-2. Shtrixkod skaner va chek printer.
-3. Soliq/fiskal integratsiya (O'zbekiston talablariga ko'ra).
-4. Inventarizatsiya (haqiqiy qoldiq bilan solishtirish).
-5. Xarid takliflarini Telegram orqali yetkazib beruvchiga yuborish.
-6. ABC-tahlil va mavsumiy prognoz.
-7. Ko'p filial.
+1. Soliq/fiskal integratsiya (O'zbekiston talablariga ko'ra).
+2. Inventarizatsiya (haqiqiy qoldiq bilan solishtirish).
+3. Xarid takliflarini Telegram orqali yetkazib beruvchiga yuborish.
+4. ABC-tahlil va mavsumiy prognoz.
+5. Offline rejim (PWA).
+6. Ko'p filial.
+
+_(Qaytarish, chegirma, nasiya, shtrixkod va chek chop etish v0.2 da qo'shildi.)_

@@ -1,9 +1,10 @@
 FROM node:22-alpine
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY *.js ./
 COPY public ./public
-ENV NODE_ENV=production PORT=3000 DB_FILE=/data/erp.db
-VOLUME /data
+ENV NODE_ENV=production PORT=3000
 EXPOSE 3000
+# DATABASE_URL (Neon yoki boshqa Postgres), ADMIN_PASSWORD majburiy
 CMD ["node", "--no-warnings", "server.js"]
