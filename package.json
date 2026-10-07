@@ -1,0 +1,12 @@
+{
+  "name": "mini-erp",
+  "version": "0.1.0",
+  "description": "Kichik va o'rta do'konlar uchun sotuv ERP (admin + sotuvchi)",
+  "type": "module",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node seed.js",
+    "test": "node --test test/*.test.js"
+  }
+}
