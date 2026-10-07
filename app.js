@@ -7,7 +7,7 @@ import { hashPassword, verifyPassword, localDate, localHour, TZ, ensureReady } f
 
 const PUBLIC = join(fileURLToPath(new URL('.', import.meta.url)), 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+  '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.webmanifest': 'application/manifest+json' };
 const CSP = "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'";
 
 class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
@@ -476,7 +476,7 @@ export function createHandler(db) {
       const rel = url.pathname === '/' ? 'index.html' : normalize(url.pathname).replace(/^([/\\])+/, '');
       if (rel.includes('..')) throw new HttpError(404, 'Topilmadi');
       const data = await readFile(join(PUBLIC, rel)).catch(() => { throw new HttpError(404, 'Topilmadi'); });
-      res.writeHead(200, { 'Content-Type': MIME[extname(rel)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': CSP });
+      res.writeHead(200, { 'Content-Type': MIME[extname(rel)] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': CSP, 'Permissions-Policy': 'camera=(self)' });
       res.end(data);
     } catch (e) {
       if (!(e instanceof HttpError)) console.error(e);

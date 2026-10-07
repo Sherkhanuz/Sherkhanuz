@@ -7,6 +7,13 @@ Ikki rolli sotuv va ombor tizimi. **Vercel** (serverless) + **Neon** (Postgres) 
 
 **Admin:** yuqoridagilarning barchasi + ombor/mahsulotlar boshqaruvi · soatma-soat va kunma-kun tushum/foyda tahlili (mahsulot bo'yicha filtr, qaytarishlar hisobga olinadi) · eng ko'p sotilgan mahsulotlar · sotuvchilar natijasi · nasiya qoldig'i · **kam qolgan mahsulotlarga xarid taklifi** → buyurtma → qabul qilinganda omborga avtomatik kirim · foydalanuvchilar.
 
+## Telefonda ishlatish va kamera skaneri
+- Interfeys telefon ekraniga moslashgan (yuqorida aylanuvchi menyu, katta tugmalar, pastda doim ko'rinib turuvchi "Sotish" paneli). Brauzer menyusidan *Ekranga qo'shish* bilan ilova kabi o'rnatiladi.
+- **Sotuv → 📷 Skaner**: telefon kamerasi ochiladi, shtrixkod (EAN-13/8, UPC, Code128/39, ITF, QR) ramkaga kelganda mahsulot savatga tushadi (ovoz + tebranish). Skaner yopilmaydi — ketma-ket bir necha mahsulotni skanerlash mumkin; kod ramkadan chiqib qaytsa, yana bir dona qo'shiladi. Kerak bo'lsa 🔦 chiroq va qo'lda kod kiritish bor.
+- Mahsulotning **SKU** maydoni shtrixkod hisoblanadi (Ombor → Tahrir). Seed ma'lumotdagi SKU'lar haqiqiy EAN-13.
+- Kamera faqat **HTTPS** (Vercel'da avtomatik) yoki `localhost` da ishlaydi. Chrome/Android'da o'rnatilgan `BarcodeDetector`, iOS Safari va boshqalarda ichki ZXing (`public/vendor/zxing.min.js`, Apache-2.0) ishlatiladi.
+- Bluetooth/USB skaner ham ishlaydi: qidiruv maydoniga kod yozib Enter bosadi.
+
 ## Lokal ishga tushirish
 ```bash
 npm install

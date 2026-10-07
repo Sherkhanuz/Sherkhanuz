@@ -36,3 +36,35 @@ svg.chart text{fill:var(--mute);font-size:10px}svg.chart .bar{fill:var(--pri)}sv
 .pick button:hover{background:var(--bg)}
 #print{display:none}
 @media print{body>*:not(#print){display:none!important}#print{display:block;width:72mm;font:12px/1.4 monospace;color:#000;background:#fff}#print .rl{display:flex;justify-content:space-between;gap:8px}}
+
+/* ---- Telefon (mobil) ---- */
+.scan-overlay{position:fixed;inset:0;z-index:50;background:#000;display:flex;flex-direction:column}
+.scan-video{flex:1;min-height:0;width:100%;object-fit:cover}
+.scan-reticle{position:absolute;left:8%;right:8%;top:22%;height:26%;border:3px solid #fff;border-radius:14px;box-shadow:0 0 0 100vmax rgba(0,0,0,.45);pointer-events:none}
+.scan-status{position:absolute;left:12px;right:12px;top:calc(env(safe-area-inset-top) + 12px);padding:10px 12px;border-radius:10px;background:rgba(0,0,0,.6);color:#fff;text-align:center}
+.scan-status.ok{background:#15803d}.scan-status.err{background:#b91c1c}
+.scan-bar{background:var(--card);color:var(--ink);padding:12px 14px calc(12px + env(safe-area-inset-bottom))}
+.scan-info{font-weight:600;margin-bottom:8px;min-height:1.4em}
+.scan-manual{width:100%}
+.btn.on{outline:3px solid #fbbf24}
+body.scanning{overflow:hidden}
+.checkout{margin-top:10px}
+.scanbtn{font-size:16px}
+@media(max-width:760px){
+  main{padding:10px}
+  header{padding:8px 10px;gap:8px;flex-wrap:nowrap}
+  header>b{display:none}
+  header .who{display:none}
+  nav{flex-wrap:nowrap;overflow-x:auto;flex:1;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
+  nav button{white-space:nowrap;padding:10px 12px}
+  input,select,button.btn{min-height:44px;font-size:16px}
+  input[type=number]{width:80px}
+  .card{padding:12px}
+  .pick{max-height:240px}
+  .pick button{padding:12px 8px}
+  th,td{padding:8px 6px}
+  .checkout{position:sticky;bottom:0;margin:10px -12px -12px;padding:10px 12px calc(10px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--line);box-shadow:0 -6px 16px rgba(0,0,0,.08);border-radius:0 0 var(--r) var(--r)}
+  .row{gap:6px}
+  .total{font-size:20px}
+}

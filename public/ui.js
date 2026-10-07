@@ -1,4 +1,5 @@
 // Mini ERP — mijoz tomoni (vanilla JS, DOM orqali; matn har doim textContent bilan qo'yiladi)
+import { openScanner } from './scanner.js';
 const $ = (s, el = document) => el.querySelector(s);
 function h(tag, attrs, ...kids) {
   const el = document.createElement(tag);
@@ -30,7 +31,7 @@ async function api(method, path, body) {
 const get = (p) => api('GET', p);
 const post = (p, b) => api('POST', p, b || {});
 
-const state = { user: null, tab: null };
+const state = { user: null, tab: null, scanner: null };
 const root = $('#root');
 
 // ---------- diagramma (inline SVG) ----------
@@ -101,7 +102,19 @@ async function sellView() {
   const matches = () => { const s = q.value.trim().toLowerCase(); return products.filter((p) => !s || p.name.toLowerCase().includes(s) || (p.sku || '').toLowerCase().includes(s)); };
   const drawList = () => list.replaceChildren(...matches().slice(0, 60).map((p) =>
     h('button', { disabled: p.stock <= 0, onclick: () => addToCart(p) }, h('span', {}, p.name), h('span', { class: 'mute' }, `${money(p.price)} · ${qf(p.stock)} ${p.unit}`))));
-  q.addEventListener('keydown', (e) => { // skaner SKU ni yozib Enter bosadi
+  const startScan = () => {
+    state.scanner = openScanner({
+      onClose: () => { state.scanner = null; drawCart(); drawList(); },
+      onCode: async (code) => {
+        const p = products.find((x) => x.sku === code);
+        if (!p) return { ok: false, msg: `Topilmadi: ${code}` };
+        const have = cart.get(p.id) || 0;
+        if (have + 1 > p.stock) return { ok: false, msg: `"${p.name}" omborda yetarli emas (${qf(p.stock)})` };
+        cart.set(p.id, have + 1);
+        return { ok: true, msg: `✓ ${p.name} — ${have + 1} ta`, info: `Savatda: ${cart.size} xil · ${money(calc().total)}` };
+      } });
+  };
+  q.addEventListener('keydown', (e) => { // klaviatura-skaner SKU ni yozib Enter bosadi
     if (e.key !== 'Enter') return;
     const code = q.value.trim(); const exact = products.find((p) => p.sku && p.sku === code);
     const hit = exact || (matches().length === 1 ? matches()[0] : null);
@@ -143,11 +156,11 @@ async function sellView() {
   };
   q.addEventListener('input', drawList); drawList(); drawCart();
   return h('div', { class: 'cols' },
-    h('div', { class: 'card' }, h('h3', {}, 'Mahsulot tanlash'), h('div', { class: 'row' }, q), list),
+    h('div', { class: 'card' }, h('h3', {}, 'Mahsulot tanlash'), h('div', { class: 'row' }, h('button', { class: 'btn scanbtn', onclick: startScan }, '📷 Skaner'), q), list),
     h('div', { class: 'card' }, h('h3', {}, 'Savat'), box, cartEl,
       h('div', { class: 'row' }, h('span', { class: 'mute' }, 'Chegirma:'), dVal, dType, cust),
-      h('div', { class: 'row' }, h('span', { class: 'mute' }, "To'lov:"), paid, method), sumEl,
-      h('button', { class: 'btn', style: 'width:100%', onclick: sell }, 'Sotish'), h('div', { style: 'margin-top:8px' }, lastEl)));
+      h('div', { class: 'row' }, h('span', { class: 'mute' }, "To'lov:"), paid, method),
+      h('div', { class: 'checkout' }, sumEl, h('button', { class: 'btn', style: 'width:100%', onclick: sell }, 'Sotish')), h('div', { style: 'margin-top:8px' }, lastEl)));
 }
 
 // ---------- Kirim (sotuvchi va admin) ----------
@@ -388,12 +401,13 @@ const TABS = {
 };
 
 async function render() {
+  state.scanner?.close();
   if (!state.user) { root.replaceChildren(loginView()); return; }
   const tabs = TABS[state.user.role]; state.tab ||= tabs[0][0];
   const main = h('main', {}, h('p', { class: 'mute' }, 'Yuklanmoqda...'));
   root.replaceChildren(h('header', {}, h('b', {}, 'Mini ERP'),
     h('nav', {}, tabs.map(([k, label]) => h('button', { class: k === state.tab ? 'on' : '', onclick: () => { state.tab = k; render(); } }, label))), h('span', { class: 'sp' }),
-    h('span', { class: 'mute' }, `${state.user.name} (${state.user.role === 'admin' ? 'admin' : 'sotuvchi'})`),
+    h('span', { class: 'mute who' }, `${state.user.name} (${state.user.role === 'admin' ? 'admin' : 'sotuvchi'})`),
     h('button', { class: 'btn sec', onclick: async () => { await post('/api/logout').catch(() => {}); state.user = null; render(); } }, 'Chiqish')), main);
   try { main.replaceChildren(await tabs.find((t) => t[0] === state.tab)[2]()); }
   catch (e) { main.replaceChildren(h('div', { class: 'msg err' }, e.message)); }

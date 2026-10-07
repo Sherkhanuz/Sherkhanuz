@@ -7,6 +7,8 @@ await ensureReady(db);
 if ((await db.one('SELECT COUNT(*)::int c FROM products')).c) { console.log('Baza bo\'sh emas, seed o\'tkazib yuborildi.'); await db.close(); process.exit(0); }
 
 const seller = (await db.one("SELECT id FROM users WHERE role='seller' ORDER BY id LIMIT 1") || await db.one('SELECT id FROM users ORDER BY id LIMIT 1')).id;
+// EAN-13 (nazorat raqami bilan) — demo mahsulotlar kamera bilan skanerlanadigan bo'lsin
+const ean13 = (body12) => body12 + ((10 - [...body12].reduce((a, d, i) => a + Number(d) * (i % 2 ? 3 : 1), 0) % 10) % 10);
 const rnd = (n) => Math.floor(Math.random() * n);
 
 // [nom, kategoriya, birlik, sotuv narxi, tannarx, minimal, kunlik o'rtacha sotuv, yetkazuvchi indeksi]
@@ -45,7 +47,7 @@ await db.tx(async (t) => {
   const supIds = await bulk(t, 'suppliers', ['name', 'phone'], [['Orient Savdo', '+998901110000'], ['Baraka Opt', '+998902220000'], ['Fresh Group', '+998903330000']], true);
   const custIds = await bulk(t, 'customers', ['name', 'phone', 'balance'], [['Karim aka', '+998909990001', 0], ['Dilnoza opa', '+998909990002', 0]], true);
   const ids = await bulk(t, 'products', ['sku', 'name', 'category', 'unit', 'price', 'cost', 'stock', 'min_stock'],
-    P.map((p, i) => [`46000${String(100 + i)}`, p[0], p[1], p[2], p[3], p[4], 0, p[5]]), true);
+    P.map((p, i) => [ean13('4600000000' + String(100 + i).slice(-2)), p[0], p[1], p[2], p[3], p[4], 0, p[5]]), true);
 
   const now = Date.now();
   const stock = P.map(() => 0);
